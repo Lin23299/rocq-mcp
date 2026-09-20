@@ -36,6 +36,7 @@ ROCQ_COQC_TIMEOUT: int = int(os.environ.get("ROCQ_COQC_TIMEOUT", "60"))
 ROCQ_VERIFY_TIMEOUT: int = int(os.environ.get("ROCQ_VERIFY_TIMEOUT", "120"))
 ROCQ_PET_TIMEOUT: float = float(os.environ.get("ROCQ_PET_TIMEOUT", "30"))
 ROCQ_QUERY_TIMEOUT_CAP: int = int(os.environ.get("ROCQ_QUERY_TIMEOUT_CAP", "300"))
+ROCQ_START_TIMEOUT: int = int(os.environ.get("ROCQ_START_TIMEOUT", "1800"))
 ROCQ_COQC_BINARY: str = os.environ.get("ROCQ_COQC_BINARY", "coqc")
 ROCQ_MAX_SOURCE_SIZE: int = int(os.environ.get("ROCQ_MAX_SOURCE_SIZE", "1000000"))
 
@@ -1350,6 +1351,8 @@ def _resolve_tool_envelope(
        falls back to it for ``timeout<=0`` and does not clamp; when
        ``None`` the helper routes through :func:`_resolve_call_timeout`
        (the per-call cap that returns a ``clamped`` flag).
+       File-backed rocq_start instead uses ROCQ_START_TIMEOUT as both
+       its default and cap, independently of the query/tactic budget.
     4. ``_validate_workspace`` against the resolved workspace; on
        failure returns a :func:`_fail` envelope with the *already
        resolved* lifespan_state so the failure lands in
@@ -1373,7 +1376,14 @@ def _resolve_tool_envelope(
     else:
         workspace = workspace or ROCQ_WORKSPACE
 
-    if timeout_default is not None:
+    if tool == "rocq_start" and file:
+        effective_timeout = float(
+            min(timeout, ROCQ_START_TIMEOUT)
+            if timeout is not None and timeout > 0
+            else ROCQ_START_TIMEOUT
+        )
+        clamped = timeout is not None and timeout > ROCQ_START_TIMEOUT
+    elif timeout_default is not None:
         effective_timeout = (
             float(timeout)
             if timeout is not None and timeout > 0
@@ -1394,14 +1404,16 @@ def _resolve_tool_envelope(
 
 
 def _finalize_tool_envelope(
-    result: Any, *, clamped: bool, ws_warning: str | None
+    result: Any, *, clamped: bool, ws_warning: str | None,
+    timeout_cap: int | None = None,
 ) -> Any:
     """Merge trailing envelope keys onto *result*.
 
     Mirrors the trailing 3-line block of every wrapper:
 
     - ``clamped_timeout``: echoes the cap value when the per-call
-      timeout was clamped by :func:`_resolve_call_timeout`.
+      timeout was clamped; defaults to the query cap unless the wrapper
+      supplies its own timeout_cap.
     - ``workspace_warning``: the advisory from
       :func:`_maybe_workspace_warning`, when set.
 
@@ -1412,7 +1424,9 @@ def _finalize_tool_envelope(
     if not isinstance(result, dict):
         return result
     if clamped:
-        result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
+        result["clamped_timeout"] = (
+            ROCQ_QUERY_TIMEOUT_CAP if timeout_cap is None else timeout_cap
+        )
     if ws_warning:
         result["workspace_warning"] = ws_warning
     return result
@@ -1676,13 +1690,14 @@ async def _run_with_pet(
                 error=(
                     f"{tool} timed out after {_timeout}s. "
                     f"Retry with `{tool}(..., timeout=<seconds>)` "
-                    f"(e.g. `timeout=180` for files with heavy library imports). "
-                    f"Server-side defaults: ROCQ_PET_TIMEOUT (base, default 30s), "
-                    f"ROCQ_QUERY_TIMEOUT_CAP (cap, default 300s). "
-                    f"If the response also includes `clamped_timeout`, you have "
-                    f"hit `ROCQ_QUERY_TIMEOUT_CAP`; call `rocq_diag` for memory "
-                    f"headroom and consider `rocq_start(..., force_restart=True)` "
-                    f"instead of bumping further."
+                    f"within the applicable server budget. File-backed rocq_start "
+                    f"uses ROCQ_START_TIMEOUT (default and cap, {ROCQ_START_TIMEOUT}s); "
+                    f"preamble-only start and query/tactic calls use ROCQ_PET_TIMEOUT "
+                    f"(base, {ROCQ_PET_TIMEOUT}s) and ROCQ_QUERY_TIMEOUT_CAP "
+                    f"(cap, {ROCQ_QUERY_TIMEOUT_CAP}s). "
+                    f"clamped_timeout reports the applicable cap when exceeded. "
+                    f"If already at that budget, diagnose the required prefix or "
+                    f"computation and call rocq_diag for memory headroom."
                 ),
                 killed_pet=True,
                 on_timeout=on_timeout,
@@ -2221,9 +2236,11 @@ async def rocq_query(
             up from *file* looking for ``_RocqProject`` / ``_CoqProject`` /
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
-        max_results: Optional maximum number of results to return.
-            Useful for broad Search patterns. If omitted, all results are
-            returned (subject to character limit).
+        max_results: Only an explicit positive value limits the number of
+            feedback results, after warning filtering. If omitted or nonpositive,
+            all results are returned. Query output has no internal character
+            truncation. The host/client may impose separate output limits.
+            Useful for broad Search patterns.
         include_warnings: If True (default), include all feedback returned
             by the query.  If False, drop entries at LSP Warning severity
             so warning noise does not crowd out tool output.
@@ -2233,9 +2250,9 @@ async def rocq_query(
             (default 300s); when clamping fires the response includes
             ``clamped_timeout: <cap>`` so the caller can diagnose unexpected
             timeouts.
-        from_state: A live state_id (from ``rocq_start`` / ``rocq_check`` /
-            ``rocq_step_multi``) to query against.  Mutually exclusive with
-            *file*.  When set, *preamble* is ignored.
+        from_state: A live state_id from ``rocq_start`` or ``rocq_check``
+            to query against. Mutually exclusive with nonempty *file* or
+            *preamble*. Queries do not register a new state_id.
 
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
@@ -2479,7 +2496,7 @@ async def rocq_start(
     character: int | None = None,
     preamble: str = "",
     force_restart: bool = False,
-    timeout: int = 0,
+    timeout: int | None = 0,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Start an interactive proof session — see goals, explore tactics.
@@ -2559,13 +2576,15 @@ async def rocq_start(
             and is unhelpful when a recent response already carried
             ``pet_restarted: True`` (pet is already fresh).  See README
             "Concurrency model".  Default: False.
-        timeout: Per-call timeout in seconds for opening the session.
-            Default 0 uses ``ROCQ_PET_TIMEOUT`` (env var, default 30).
-            Raise this for files with heavy library imports.
-            Clamped to ``ROCQ_QUERY_TIMEOUT_CAP`` (default 300s) so a stray
-            large value cannot park the pet lock indefinitely; when
-            clamping fires the response includes ``clamped_timeout:
-            <cap>`` so the caller can diagnose unexpected timeouts.
+        timeout: Total request budget in seconds for opening the session,
+            not a per-sentence tactic limit. With file (theorem or position
+            mode), default and cap are ``ROCQ_START_TIMEOUT``
+            (env var, default 1800s). Without file, preamble mode retains
+            ``ROCQ_PET_TIMEOUT`` (env var, default 30s; CCV sets 300s)
+            and ``ROCQ_QUERY_TIMEOUT_CAP`` (default 300s).
+            None, 0, and negative values use the corresponding default;
+            positive values below the cap are respected. Larger values
+            are capped and the response includes ``clamped_timeout: <cap>``.
 
     On theorem-not-found errors: response includes ``available_in_file:
     list[str]`` with the file's defined names (sorted, capped — see
@@ -2597,7 +2616,10 @@ async def rocq_start(
         force_restart=force_restart,
         timeout=effective_timeout,
     )
-    return _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+    return _finalize_tool_envelope(
+        result, clamped=clamped, ws_warning=ws_warning,
+        timeout_cap=ROCQ_START_TIMEOUT if file else ROCQ_QUERY_TIMEOUT_CAP,
+    )
 
 
 # ---------------------------------------------------------------------------

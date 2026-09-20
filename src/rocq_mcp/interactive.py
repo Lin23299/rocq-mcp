@@ -52,8 +52,6 @@ from rocq_mcp.compile import _split_rocq_sentences, _is_focus_token
 # Goal formatting helper (shared by run_check, run_step_multi)
 # ---------------------------------------------------------------------------
 
-_MAX_GOALS_LENGTH: int = 8000  # Max chars for formatted goals output
-_MAX_GOALS_SHOWN: int = 10  # Max number of goals to format
 _MAX_FEEDBACK_LENGTH: int = 50_000  # Max chars per feedback step
 _MAX_TOTAL_FEEDBACK: int = 200_000  # Max total chars across all feedback steps
 # Max line / character index accepted by ``rocq_start`` in by-position
@@ -98,9 +96,13 @@ def _extract_feedback(state: Any, *, include_warnings: bool = True) -> str | Non
 def _format_goals(goals_list: list[Any]) -> str:
     """Format goal objects into readable text with hypotheses."""
     total = len(goals_list)
-    shown = min(total, _MAX_GOALS_SHOWN)
     parts = []
-    for i, g in enumerate(goals_list[:shown]):
+    for i, g in enumerate(goals_list):
+        # PyTanque 只将 focused goals 解码成对象，旁支仍是 JSON。
+        if isinstance(g, dict):
+            from pytanque.protocol import Goal
+
+            g = Goal.from_json(g)
         hyps = "\n".join(
             f"{', '.join(h.names)}" f"{' := ' + h.def_ if h.def_ else ''}" f" : {h.ty}"
             for h in g.hyps
@@ -110,15 +112,25 @@ def _format_goals(goals_list: list[Any]) -> str:
             parts.append(f"Goal {i + 1}:\n{pp}")
         else:
             parts.append(pp)
-    if total > shown:
-        parts.append(f"... ({total} goals total, showing first {shown})")
-    result = "\n\n".join(parts)
-    total_len = len(result)
-    if total_len > _MAX_GOALS_LENGTH:
-        result = (
-            result[:_MAX_GOALS_LENGTH] + f"... (truncated, {total_len} chars total)"
-        )
-    return result
+    return "\n\n".join(parts)
+
+
+def _format_complete_goals(complete: Any) -> str:
+    """展示全部目标；保留 focus 层次与左右旁支的归属。"""
+    if complete is None:
+        return ""
+    groups = [("Focused goals", complete.goals)]
+    for depth, (left, right) in enumerate(complete.stack, 1):
+        groups.append((f"Stack {depth} left", left))
+        groups.append((f"Stack {depth} right", right))
+    groups.extend([
+        ("Shelved goals", complete.shelf),
+        ("Given-up goals", complete.given_up),
+    ])
+    return "\n\n".join(
+        f"{label}:\n{_format_goals(goals)}"
+        for label, goals in groups if goals
+    )
 
 
 def _focus_depth(complete: Any) -> int | None:
@@ -137,20 +149,13 @@ def _focus_depth(complete: Any) -> int | None:
 
 
 def _try_get_goals_with_depth(pet: Any, state: Any) -> tuple[str | None, int | None]:
-    """Best-effort ``(goals_text, focus_depth)`` from one ``complete_goals`` call.
-
-    Both elements are ``None`` if the call fails.
-    """
-    try:
-        complete = pet.complete_goals(state)
-        goals_list = complete.goals if complete else []
-        return _format_goals(goals_list) or None, _focus_depth(complete)
-    except Exception:
-        return None, None
+    """完整读取反馈；后端或格式化失败交由调用入口报告，不冒充空目标。"""
+    complete = pet.complete_goals(state)
+    return _format_complete_goals(complete) or None, _focus_depth(complete)
 
 
 def _try_get_goals(pet: Any, state: Any) -> str | None:
-    """Best-effort goal retrieval.  Returns formatted text or None."""
+    """Return formatted goals or None for empty goals; propagate failures."""
     text, _ = _try_get_goals_with_depth(pet, state)
     return text
 
@@ -200,6 +205,21 @@ _import_cache: dict[str, _CachedImportContext] = {}
 _import_cache_generation: int = 0
 
 
+def _is_prefix_error(error: Exception) -> bool:
+    """只识别后端明确报告的 Coq 前缀失败，不包含 Anomaly/传输错误。"""
+    return (
+        _PetanqueError is not None and isinstance(error, _PetanqueError)
+        and error.code == -32003
+        and error.message.startswith("Coq: prefix check failed:")
+    )
+
+
+def _eof_position(content: str) -> tuple[int, int]:
+    """与 Flèche Contents.get_last_text 一致：保留 CR，列按 UTF-16 计。"""
+    last_line = content.rsplit("\n", 1)[-1]
+    return content.count("\n"), len(last_line.encode("utf-16-le")) // 2
+
+
 def _get_or_create_import_state(
     pet: Any,
     workspace: str,
@@ -229,9 +249,10 @@ def _get_or_create_import_state(
     # at the end gives us the complete post-import state.
     cache_content = "\n".join(import_commands) + "\n" if import_commands else ""
     cache_file = Path(ws) / f"rocq_mcp_cache_{os.getpid()}_.v"
-    file_changed = not cache_file.exists() or cache_file.read_text() != cache_content
+    cache_bytes = cache_content.encode("utf-8")
+    file_changed = not cache_file.exists() or cache_file.read_bytes() != cache_bytes
     if file_changed:
-        cache_file.write_text(cache_content)
+        cache_file.write_bytes(cache_bytes)
 
     # The file must exist on disk before set_workspace so coq-lsp can
     # index it.  Force a workspace re-set when the file content changed
@@ -240,10 +261,12 @@ def _get_or_create_import_state(
         lifespan_state["current_workspace"] = None  # force re-set
     _server._set_workspace_if_needed(pet, workspace, lifespan_state)
 
-    # Position past the last line so all imports are in scope.
-    # +1 ensures consistency with _get_file_end_state line counting.
-    end_line = cache_content.count("\n") + 1
-    state = pet.get_state_at_pos(str(cache_file), end_line, 0)
+    if cache_content == "":
+        # 空文档没有 AST node；root 是显式空输入路径，不是失败降级。
+        state = pet.get_root_state(str(cache_file))
+    else:
+        line, character = _eof_position(cache_content)
+        state = pet.get_state_at_pos(str(cache_file), line, character)
 
     _import_cache[imports_key] = _CachedImportContext(
         state=state,
@@ -268,8 +291,8 @@ def _get_file_end_state(
     """Get pytanque State at end of a ``.v`` file (all definitions in scope).
 
     Resolves the file path, validates workspace containment, sets the
-    workspace, counts lines, and calls ``pet.get_state_at_pos`` past the
-    last line.  The returned state has all imports, definitions, and
+    workspace, and requests the exact EOF state (root for empty content).
+    The returned state has all imports, definitions, and
     notations from the file in scope.
 
     This is used by tools that accept a ``file`` parameter as an
@@ -282,7 +305,8 @@ def _get_file_end_state(
     resolved = _server._resolve_file_in_workspace(file, workspace)
 
     try:
-        content = Path(resolved).read_text()
+        # Linux 后端 read_raw 保留换行字节；不能用 read_text 归一化 CRLF/CR。
+        content = Path(resolved).read_bytes().decode("utf-8")
     except PermissionError:
         raise FileNotFoundError(f"File not accessible: {file}")
 
@@ -293,11 +317,10 @@ def _get_file_end_state(
     # on every sibling call against the same project.
     _server._set_workspace_if_needed(pet, workspace, lifespan_state)
 
-    # Position past the last line so all definitions are in scope.
-    # +1 ensures files without a trailing newline still capture the last line.
-    end_line = content.count("\n") + 1
-
-    return pet.get_state_at_pos(resolved, end_line, 0)
+    if content == "":
+        return pet.get_root_state(resolved)
+    line, character = _eof_position(content)
+    return pet.get_state_at_pos(resolved, line, character)
 
 
 def _invalidate_import_cache() -> None:
@@ -569,6 +592,7 @@ _server._pet_invalidation_hooks.append(_state_invalidate_all)
 # Tool: rocq_query (with import caching)
 # ---------------------------------------------------------------------------
 
+# 保留 toc/notations 的既有字符上限；run_query 不再使用此限制。
 _MAX_QUERY_OUTPUT = 8000
 
 
@@ -674,6 +698,17 @@ async def run_query(
                 state = _get_file_end_state(pet, file, workspace, lifespan_state)
             except (ValueError, FileNotFoundError) as e:
                 return _server._fail(lifespan_state, "rocq_query", str(e))
+            except Exception as e:
+                if (
+                    _is_prefix_error(e)
+                    and _server._pet_alive(lifespan_state.get("pet_client"))
+                ):
+                    if auto_record:
+                        _server._record_error(
+                            lifespan_state, "rocq_query", e.message, reason="validation"
+                        )
+                    return {"success": False, "error": e.message, "reason": "validation"}
+                raise
         else:
             preamble_text = preamble.strip()
             preamble_cmds = (
@@ -693,7 +728,7 @@ async def run_query(
                 (lvl, msg) for lvl, msg in feedback if lvl != _LSP_SEVERITY_WARNING
             ]
 
-        # Apply result-count limit before character truncation
+        # 只应用显式结果条数限制；query 文本不按字符裁剪。
         total_results = len(feedback)
         if max_results is not None and max_results > 0 and total_results > max_results:
             feedback = feedback[:max_results]
@@ -703,11 +738,6 @@ async def run_query(
             output += (
                 f"\n... ({total_results - max_results} more results, "
                 f"{total_results} total)"
-            )
-        if len(output) > _MAX_QUERY_OUTPUT:
-            output = (
-                output[:_MAX_QUERY_OUTPUT]
-                + f"\n... (truncated, {len(output)} total chars)"
             )
         resp: dict[str, Any] = {"success": True, "output": output or "(no output)"}
         if from_state_id is not None:
@@ -837,23 +867,27 @@ async def run_assumptions(
             reason in _TRANSPORT_FAILURE_REASONS and reason != "crashed"
         ) or (reason == "crashed" and pet_restarted)
         retagged_not_found = False
-        if "available_in_file" not in query_result and not is_transport_failure:
+        # Rocq 9.0 Himsg 的 GlobalizationError；只折叠排版空白，名称逐字匹配。
+        error = " ".join(query_result.get("error", "").split())
+        can_enrich = (
+            reason == "crashed"
+            and error == f"Coq: The reference {clean_name} was not found in the current environment."
+        )
+        if ("available_in_file" not in query_result
+                and not is_transport_failure and can_enrich):
             result = await _fetch_available_in_file(
                 file=file,
                 workspace=workspace,
                 lifespan_state=lifespan_state,
                 tool="rocq_assumptions",
             )
-            _attach_available_in_file(query_result, result)
-            if result.names:
-                # Non-empty names means the file IS valid; the failure
-                # was about the requested name (a typo).  Re-tag as
-                # ``not_found`` so ``rocq_diag`` reports it correctly
-                # rather than as the generic ``crashed`` reason
-                # ``_run_with_pet`` would have set on a Coq error.
-                if query_result.get("reason") != "not_found":
-                    query_result["reason"] = "not_found"
-                    retagged_not_found = True
+            if isinstance(result, dict):
+                query_result = result
+            else:
+                _attach_available_in_file(query_result, result)
+                # 缺名由原始错误坐实，与 TOC 是否为空无关。
+                query_result["reason"] = "not_found"
+                retagged_not_found = True
         final_reason = query_result.get("reason") or "crashed"
         # Idempotency: when reason is already ``not_found`` from the
         # inner layer (a future ``run_query`` classification) and we
@@ -1046,18 +1080,22 @@ def _collect_toc_names(toc_result: Any, source: str = "") -> list[str]:
     return names
 
 
-def _toc_names_cached(pet: Any, resolved_file: str) -> list[str]:
+def _toc_names_cached(
+    pet: Any, resolved_file: str, *, strict: bool = False
+) -> list[str]:
     """Return sorted addressable names in ``resolved_file`` via ``pet.toc``,
     cached by ``(file, mtime)``.
 
-    Returns an empty list on any error (best-effort enrichment) and does
-    *not* cache the failure — a transient pet hiccup should not poison
+    Unless strict, returns an empty list on error (best-effort enrichment).
+    Does not cache failures — a transient pet hiccup should not poison
     the cache for the rest of the session.  Bounded to
     :data:`_TOC_CACHE_MAX` entries with FIFO eviction on success.
     """
     try:
         mtime = os.path.getmtime(resolved_file)
     except OSError:
+        if strict:
+            raise
         return []
     key = (resolved_file, mtime)
     if key in _TOC_CACHE:
@@ -1067,9 +1105,13 @@ def _toc_names_cached(pet: Any, resolved_file: str) -> list[str]:
         try:
             source = Path(resolved_file).read_text()
         except OSError:
+            if strict:
+                raise
             source = ""
         names = sorted(_collect_toc_names(toc_result, source=source))
     except Exception:
+        if strict:
+            raise
         # Do not cache failures: caller will retry next time.
         return []
     if len(_TOC_CACHE) >= _TOC_CACHE_MAX:
@@ -1169,41 +1211,37 @@ async def _fetch_available_in_file(
     workspace: str,
     lifespan_state: dict[str, Any],
     tool: str,
-) -> _AvailableInFile:
+) -> _AvailableInFile | dict[str, Any]:
     """Async wrapper that fetches the (capped) name list for *file*.
 
     Resolves *file* against *workspace*, runs ``pet.toc`` (cached) under
     the pet lock, and returns an :class:`_AvailableInFile` with
-    ``names``, ``truncated``, and ``total``.  On any error returns an
-    empty result (``names=[]``, ``truncated=False``, ``total=0``) —
-    this is best-effort enrichment that must never break the primary
-    failure response.
+    ``names``, ``truncated``, and ``total``. On error returns the failure
+    envelope, not an empty TOC. The caller records the final error once;
+    transport failures still invalidate the backend inside _run_with_pet.
 
     *tool* is forwarded to ``_run_with_pet`` so any pet-level failure
-    during the toc lookup is attributed to the calling tool in
-    ``recent_errors``.  Required (no default) because there is no
+    during the toc lookup is attributed to the calling tool.
+    Required (no default) because there is no
     sensible fallback — silently mis-attributing a future caller's
     failure to ``rocq_assumptions`` would be a bug.
     """
     try:
         resolved = _server._resolve_file_in_workspace(file, workspace)
-    except (ValueError, FileNotFoundError, OSError):
-        return _AvailableInFile([], False, 0)
+    except (ValueError, FileNotFoundError, OSError) as e:
+        return {"success": False, "reason": "validation", "error": str(e)}
 
     def _do_toc(pet: Any) -> list[str]:
-        return _toc_names_cached(pet, resolved)
+        return _toc_names_cached(pet, resolved, strict=True)
 
-    try:
-        names = await _server._run_with_pet(
-            _do_toc,
-            lifespan_state,
-            tool,
-        )
-    except Exception:
-        return _AvailableInFile([], False, 0)
-    if not isinstance(names, list):
-        # _run_with_pet returns a failure dict on errors; treat as empty.
-        return _AvailableInFile([], False, 0)
+    names = await _server._run_with_pet(
+        _do_toc,
+        lifespan_state,
+        tool,
+        auto_record=False,
+    )
+    if isinstance(names, dict):
+        return names
     total = len(names)
     capped, truncated = _truncate_names(names)
     return _AvailableInFile(capped, truncated, total)
@@ -1372,7 +1410,17 @@ def _build_position_start_result(
     full rule.
     """
     _server._set_workspace_if_needed(pet, workspace, lifespan_state)
-    state = pet.get_state_at_pos(resolved_file, line, character)
+    try:
+        state = pet.get_state_at_pos(resolved_file, line, character)
+    except Exception as e:
+        if (
+            _is_prefix_error(e)
+            and _server._pet_alive(lifespan_state.get("pet_client"))
+        ):
+            return _server._fail(
+                lifespan_state, "rocq_start", e.message, reason="validation"
+            )
+        raise
 
     file_mtime: float | None = None
     tracked_file: str | None = None
@@ -1384,6 +1432,7 @@ def _build_position_start_result(
         tracked_file = resolved_file
 
     theorem = f"@pos({line},{character})"
+    goals, focus_depth = _try_get_goals_with_depth(pet, state)
     state_id = _state_add(
         state=state,
         file=file,
@@ -1396,7 +1445,6 @@ def _build_position_start_result(
         resolved_file=tracked_file,
         vo_epoch=_server._current_vo_epoch(lifespan_state, workspace),
     )
-    goals, focus_depth = _try_get_goals_with_depth(pet, state)
     result: dict[str, Any] = {
         "success": True,
         "state_id": state_id,
@@ -1432,12 +1480,16 @@ def _build_theorem_start_result(
         if _PetanqueError is not None and isinstance(e, _PetanqueError):
             if not _server._pet_alive(lifespan_state.get("pet_client")):
                 raise
-            try:
-                all_names = _toc_names_cached(pet, resolved_file)
-                capped, truncated = _truncate_names(all_names)
-                avail = _AvailableInFile(capped, truncated, len(all_names))
-            except Exception:
-                avail = _AvailableInFile([], False, 0)
+            # 只认明确的前缀错误；系统异常保留原通道，不借全文 toc 补诊断。
+            if _is_prefix_error(e):
+                return _server._fail(
+                    lifespan_state, "rocq_start", e.message, reason="validation"
+                )
+            if e.code != -32006:
+                raise
+            all_names = _toc_names_cached(pet, resolved_file, strict=True)
+            capped, truncated = _truncate_names(all_names)
+            avail = _AvailableInFile(capped, truncated, len(all_names))
             resp: dict[str, Any] = {
                 "success": False,
                 "error": e.message,
@@ -1454,6 +1506,7 @@ def _build_theorem_start_result(
         file_mtime: float | None = os.path.getmtime(resolved_file)
     except OSError:
         file_mtime = None
+    goals, focus_depth = _try_get_goals_with_depth(pet, state)
     state_id = _state_add(
         state=state,
         file=file,
@@ -1466,7 +1519,6 @@ def _build_theorem_start_result(
         resolved_file=resolved_file,
         vo_epoch=_server._current_vo_epoch(lifespan_state, workspace),
     )
-    goals, focus_depth = _try_get_goals_with_depth(pet, state)
     result: dict[str, Any] = {
         "success": True,
         "state_id": state_id,
@@ -1492,6 +1544,7 @@ def _build_preamble_start_result(
     import_state = _get_or_create_import_state(
         pet, workspace, preamble_cmds, lifespan_state
     )
+    goals = _try_get_goals(pet, import_state)
     state_id = _state_add(
         state=import_state,
         file="<preamble>",
@@ -1505,7 +1558,7 @@ def _build_preamble_start_result(
     return {
         "success": True,
         "state_id": state_id,
-        "goals": "",
+        "goals": goals or "",
         "file": "<preamble>",
         "theorem": "<preamble>",
         "proof_finished": getattr(import_state, "proof_finished", False),
@@ -1879,18 +1932,6 @@ async def run_check(
         return _server._fail(lifespan_state, "rocq_check", err)
     assert entry is not None and base_state_id is not None  # err is None here
 
-    # Empty body — return early.
-    if not commands:
-        return {
-            "success": True,
-            "commands_run": 0,
-            "state_id": base_state_id,
-            "from_state_id": base_state_id,
-            "goals": "",
-            "proof_finished": entry.proof_finished,
-            "check_time_ms": 0,
-        }
-
     _timeout: float = (
         timeout
         if timeout is not None and timeout > 0
@@ -1958,13 +1999,8 @@ async def run_check(
 
         elapsed = time.monotonic() - start_time
 
-        try:
-            complete = pet.complete_goals(state)
-            goals_list = complete.goals if complete else []
-            goals_text = _format_goals(goals_list)
-        except Exception:
-            goals_text = "(goals unavailable)"
-            complete = None
+        complete = pet.complete_goals(state)
+        goals_text = _format_complete_goals(complete)
 
         return _build_check_success_dict(
             goals_text=goals_text,
@@ -2103,20 +2139,6 @@ async def run_step_multi(
                         entry_dict["feedback"] = fb_text
                         total_feedback_size += len(fb_text)
 
-                complete = pet.complete_goals(new_state)
-                goals_list = complete.goals if complete else []
-
-                goals_text = _format_goals(goals_list)
-                entry_dict["success"] = True
-                entry_dict["goals"] = goals_text or "No goals remaining."
-                entry_dict["proof_finished"] = new_state.proof_finished
-                if complete and complete.shelf:
-                    entry_dict["shelved_goals"] = len(complete.shelf)
-                if complete and complete.given_up:
-                    entry_dict["given_up_goals"] = len(complete.given_up)
-                depth = _focus_depth(complete)
-                if depth is not None:
-                    entry_dict["focus_depth"] = depth
             except PetanqueError as e:
                 # If pet died, re-raise so outer handler detects it.
                 if not _server._pet_alive(lifespan_state.get("pet_client")):
@@ -2129,6 +2151,20 @@ async def run_step_multi(
                 entry_dict["success"] = False
                 entry_dict["reason"] = "tactic_failed"
                 entry_dict["error"] = e.message
+            else:
+                # 目标读取失败不是 tactic 失败，交由外层报告并处理死亡进程。
+                complete = pet.complete_goals(new_state)
+                goals_text = _format_complete_goals(complete)
+                entry_dict["success"] = True
+                entry_dict["goals"] = goals_text or "No goals remaining."
+                entry_dict["proof_finished"] = new_state.proof_finished
+                if complete and complete.shelf:
+                    entry_dict["shelved_goals"] = len(complete.shelf)
+                if complete and complete.given_up:
+                    entry_dict["given_up_goals"] = len(complete.given_up)
+                depth = _focus_depth(complete)
+                if depth is not None:
+                    entry_dict["focus_depth"] = depth
 
             partial_state["partial_results"].append(entry_dict)
 
