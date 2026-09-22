@@ -63,6 +63,25 @@ _MAX_LINE_CHAR_RANGE: int = 100_000
 # See coq-lsp 0.2.5+9.1: lang/diagnostic.ml.
 _LSP_SEVERITY_WARNING: int = 2
 
+# ---------------------------------------------------------------------------
+# Goal text budgets
+# ---------------------------------------------------------------------------
+# Deep proof states expand to hundreds of KB: one VST goal can carry 400 KB of
+# hypotheses / SEP terms / command+POST text, which blows every host's
+# tool-output cap and lands in an unreadable single-line JSON file.  Oversized
+# goals are therefore clipped *structurally*: every hypothesis keeps its name,
+# its type is sliced head+tail, and the conclusion is sliced head+tail (the
+# tail carries ``|- ty`` / POSTCONDITION).  Goals within budget are returned
+# byte-identically to the legacy format.
+# ``0``/negative disables clipping; per-call ``goals_max_chars=-1`` bypasses
+# it for one response.  Deployment knobs:
+# ``ROCQ_MAX_GOAL_CHARS`` / ``ROCQ_MAX_GOALS_TOTAL_CHARS``.
+_MAX_GOAL_CHARS: int = int(os.environ.get("ROCQ_MAX_GOAL_CHARS", "12000"))
+_MAX_GOALS_TOTAL_CHARS: int = int(
+    os.environ.get("ROCQ_MAX_GOALS_TOTAL_CHARS", "40000")
+)
+_HYP_TYPE_MIN_CHARS: int = 60
+
 
 def _truncate_result(text: str, max_length: int) -> str:
     """Truncate *text* to *max_length* chars, appending an indicator if cut."""
@@ -93,8 +112,57 @@ def _extract_feedback(state: Any, *, include_warnings: bool = True) -> str | Non
     return _truncate_result(raw, _MAX_FEEDBACK_LENGTH)
 
 
-def _format_goals(goals_list: list[Any]) -> str:
+def _clip_middle(text: str, budget: int) -> str:
+    """Keep head+tail of *text* within *budget* chars, marking the exact cut.
+
+    The tail matters: a goal's conclusion is its final ``|- ty`` part and a
+    hypothesis type often ends in the interesting constructor.  The marker
+    reports the exact original length so a clipped view is never mistaken
+    for the whole text.
+    """
+    if budget <= 0 or len(text) <= budget:
+        return text
+    tail = budget // 2
+    head = budget - tail
+    return (
+        text[:head]
+        + f"\n…[clipped {len(text) - budget} of {len(text)} chars; "
+        f"pass goals_max_chars=-1 for the full text]…\n"
+        + text[-tail:]
+    )
+
+
+def _format_goal(goal: Any, max_chars: int) -> str:
+    """One goal → text; over budget the shape is kept, the bodies are sliced."""
+
+    def hyp(h: Any, budget: int) -> str:
+        return (
+            f"{', '.join(h.names)}" f"{' := ' + h.def_ if h.def_ else ''}"
+            f" : {_clip_middle(h.ty, budget)}"
+        )
+
+    pp = "\n".join(hyp(h, 0) for h in goal.hyps) + f"\n|-{goal.ty}"
+    if max_chars <= 0 or len(pp) <= max_chars:
+        return pp
+    # Oversized: the conclusion gets up to half the budget; the rest is split
+    # across hypotheses, reserving ~120 chars per hypothesis for its name and
+    # clip marker so the final size check rarely has to fall back to a
+    # whole-goal clip (which would drop middle hypothesis names entirely).
+    n = max(1, len(goal.hyps))
+    concl_budget = max(1000, min(max_chars // 2, max_chars - n * 200))
+    hyp_budget = max(_HYP_TYPE_MIN_CHARS, (max_chars - concl_budget) // n - 120)
+    pp = (
+        "\n".join(hyp(h, hyp_budget) for h in goal.hyps)
+        + f"\n|-{_clip_middle(goal.ty, concl_budget)}"
+    )
+    if len(pp) > max_chars:
+        pp = _clip_middle(pp, max_chars)
+    return pp
+
+
+def _format_goals(goals_list: list[Any], *, max_chars: int | None = None) -> str:
     """Format goal objects into readable text with hypotheses."""
+    limit = _MAX_GOAL_CHARS if max_chars is None else max_chars
     total = len(goals_list)
     parts = []
     for i, g in enumerate(goals_list):
@@ -103,11 +171,7 @@ def _format_goals(goals_list: list[Any]) -> str:
             from pytanque.protocol import Goal
 
             g = Goal.from_json(g)
-        hyps = "\n".join(
-            f"{', '.join(h.names)}" f"{' := ' + h.def_ if h.def_ else ''}" f" : {h.ty}"
-            for h in g.hyps
-        )
-        pp = f"{hyps}\n|-{g.ty}"
+        pp = _format_goal(g, limit)
         if total > 1:
             parts.append(f"Goal {i + 1}:\n{pp}")
         else:
@@ -115,7 +179,7 @@ def _format_goals(goals_list: list[Any]) -> str:
     return "\n\n".join(parts)
 
 
-def _format_complete_goals(complete: Any) -> str:
+def _format_complete_goals(complete: Any, *, max_chars: int | None = None) -> str:
     """展示全部目标；保留 focus 层次与左右旁支的归属。"""
     if complete is None:
         return ""
@@ -127,10 +191,13 @@ def _format_complete_goals(complete: Any) -> str:
         ("Shelved goals", complete.shelf),
         ("Given-up goals", complete.given_up),
     ])
-    return "\n\n".join(
-        f"{label}:\n{_format_goals(goals)}"
+    text = "\n\n".join(
+        f"{label}:\n{_format_goals(goals, max_chars=max_chars)}"
         for label, goals in groups if goals
     )
+    if max_chars is not None:
+        return text  # explicit override (incl. -1) bypasses the total cap
+    return _clip_middle(text, _MAX_GOALS_TOTAL_CHARS)
 
 
 def _focus_depth(complete: Any) -> int | None:
@@ -148,15 +215,22 @@ def _focus_depth(complete: Any) -> int | None:
     return len(complete.stack)
 
 
-def _try_get_goals_with_depth(pet: Any, state: Any) -> tuple[str | None, int | None]:
+def _try_get_goals_with_depth(
+    pet: Any, state: Any, max_chars: int | None = None
+) -> tuple[str | None, int | None]:
     """完整读取反馈；后端或格式化失败交由调用入口报告，不冒充空目标。"""
     complete = pet.complete_goals(state)
-    return _format_complete_goals(complete) or None, _focus_depth(complete)
+    return (
+        _format_complete_goals(complete, max_chars=max_chars) or None,
+        _focus_depth(complete),
+    )
 
 
-def _try_get_goals(pet: Any, state: Any) -> str | None:
+def _try_get_goals(
+    pet: Any, state: Any, max_chars: int | None = None
+) -> str | None:
     """Return formatted goals or None for empty goals; propagate failures."""
-    text, _ = _try_get_goals_with_depth(pet, state)
+    text, _ = _try_get_goals_with_depth(pet, state, max_chars)
     return text
 
 
@@ -1399,6 +1473,7 @@ def _build_position_start_result(
     line: int,
     character: int,
     track_staleness: bool = True,
+    goals_max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Return the rocq_start-style payload for a position-based state.
 
@@ -1432,7 +1507,7 @@ def _build_position_start_result(
         tracked_file = resolved_file
 
     theorem = f"@pos({line},{character})"
-    goals, focus_depth = _try_get_goals_with_depth(pet, state)
+    goals, focus_depth = _try_get_goals_with_depth(pet, state, goals_max_chars)
     state_id = _state_add(
         state=state,
         file=file,
@@ -1466,6 +1541,7 @@ def _build_theorem_start_result(
     theorem: str,
     workspace: str,
     lifespan_state: dict[str, Any],
+    goals_max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Return the rocq_start-style payload for a theorem-based state."""
     _server._set_workspace_if_needed(pet, workspace, lifespan_state)
@@ -1506,7 +1582,7 @@ def _build_theorem_start_result(
         file_mtime: float | None = os.path.getmtime(resolved_file)
     except OSError:
         file_mtime = None
-    goals, focus_depth = _try_get_goals_with_depth(pet, state)
+    goals, focus_depth = _try_get_goals_with_depth(pet, state, goals_max_chars)
     state_id = _state_add(
         state=state,
         file=file,
@@ -1538,13 +1614,14 @@ def _build_preamble_start_result(
     preamble: str,
     workspace: str,
     lifespan_state: dict[str, Any],
+    goals_max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Return the rocq_start-style payload for a preamble-based state."""
     preamble_cmds = _split_rocq_sentences(preamble) if preamble.strip() else []
     import_state = _get_or_create_import_state(
         pet, workspace, preamble_cmds, lifespan_state
     )
-    goals = _try_get_goals(pet, import_state)
+    goals = _try_get_goals(pet, import_state, goals_max_chars)
     state_id = _state_add(
         state=import_state,
         file="<preamble>",
@@ -1576,6 +1653,7 @@ async def capture_position_state(
     tool: str,
     track_staleness: bool = True,
     timeout: float | None = None,
+    goals_max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Capture a position-based proof state via the async PET helper.
 
@@ -1599,6 +1677,7 @@ async def capture_position_state(
             line=line,
             character=character,
             track_staleness=track_staleness,
+            goals_max_chars=goals_max_chars,
         )
 
     return await _server._run_with_pet(
@@ -1619,6 +1698,7 @@ async def run_start(
     preamble: str = "",
     force_restart: bool = False,
     timeout: float | None = None,
+    goals_max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Open a proof context and return a state_id.
 
@@ -1682,6 +1762,7 @@ async def run_start(
                 theorem=theorem,
                 workspace=workspace,
                 lifespan_state=lifespan_state,
+                goals_max_chars=goals_max_chars,
             )
         if _start_by_pos:
             return _build_position_start_result(
@@ -1692,12 +1773,14 @@ async def run_start(
                 lifespan_state=lifespan_state,
                 line=line,
                 character=character,
+                goals_max_chars=goals_max_chars,
             )
         return _build_preamble_start_result(
             pet,
             preamble=preamble,
             workspace=workspace,
             lifespan_state=lifespan_state,
+            goals_max_chars=goals_max_chars,
         )
 
     if force_restart:
@@ -1732,6 +1815,7 @@ def _run_one_check_command(
     total_feedback_size: int,
     stale_warning: str | None,
     lifespan_state: dict[str, Any],
+    goals_max_chars: int | None = None,
 ) -> tuple[Any, int, list[str] | None, dict[str, Any] | None]:
     """Run one ``run_check`` command and report its outcome.
 
@@ -1793,7 +1877,7 @@ def _run_one_check_command(
             failed_command=cmd,
             command_index=command_index,
             last_valid_state_id=prev_state_id,
-            goals_at_failure=_try_get_goals(pet, state),
+            goals_at_failure=_try_get_goals(pet, state, goals_max_chars),
             feedback_pairs=feedback_pairs,
             stale_warning=stale_warning,
         )
@@ -1900,6 +1984,7 @@ async def run_check(
     *,
     timeout: float | None = None,
     include_warnings: bool = True,
+    goals_max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Execute commands sequentially from a state.
 
@@ -1986,6 +2071,7 @@ async def run_check(
                 total_feedback_size=total_feedback_size,
                 stale_warning=stale_warning,
                 lifespan_state=lifespan_state,
+                goals_max_chars=goals_max_chars,
             )
             if failure is not None:
                 return failure
@@ -2000,7 +2086,7 @@ async def run_check(
         elapsed = time.monotonic() - start_time
 
         complete = pet.complete_goals(state)
-        goals_text = _format_complete_goals(complete)
+        goals_text = _format_complete_goals(complete, max_chars=goals_max_chars)
 
         return _build_check_success_dict(
             goals_text=goals_text,
@@ -2041,6 +2127,7 @@ async def run_step_multi(
     *,
     include_warnings: bool = True,
     timeout: float | None = None,
+    goals_max_chars: int | None = None,
 ) -> dict[str, Any]:
     """Core implementation of rocq_step_multi (testable without FastMCP Context).
 
@@ -2154,7 +2241,9 @@ async def run_step_multi(
             else:
                 # 目标读取失败不是 tactic 失败，交由外层报告并处理死亡进程。
                 complete = pet.complete_goals(new_state)
-                goals_text = _format_complete_goals(complete)
+                goals_text = _format_complete_goals(
+                    complete, max_chars=goals_max_chars
+                )
                 entry_dict["success"] = True
                 entry_dict["goals"] = goals_text or "No goals remaining."
                 entry_dict["proof_finished"] = new_state.proof_finished

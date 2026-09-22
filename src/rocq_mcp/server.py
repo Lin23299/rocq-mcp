@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import os
 import re
 import shutil
@@ -25,6 +26,12 @@ from typing import Any, Callable
 import psutil
 from fastmcp import FastMCP, Context
 from fastmcp.server.lifespan import lifespan
+from mcp.types import TextContent
+
+try:  # fastmcp >= 4 exposes ToolResult; older versions keep the plain dict.
+    from fastmcp.tools.base import ToolResult
+except ImportError:  # pragma: no cover - exercised only on fastmcp < 4
+    ToolResult = None  # type: ignore[assignment,misc]
 
 # ---------------------------------------------------------------------------
 # Configuration (env vars with defaults)
@@ -1403,6 +1410,79 @@ def _resolve_tool_envelope(
     return workspace, lifespan_state, ws_warning, clamped, effective_timeout
 
 
+# Large text fields moved out of the JSON envelope into their own content
+# blocks, so real newlines survive the transport (a JSON string would escape
+# them and collapse the whole response into one unreadable single line that
+# every host truncates).  The envelope keeps ``<field>_chars`` and the full
+# dict stays available as ``structured_content``.
+_TEXT_BLOCK_FIELDS: tuple[str, ...] = ("goals", "goals_at_failure", "output")
+
+
+def _split_text_blocks(text: str) -> list[Any] | None:
+    """Parse a tool result JSON string; return content blocks or None.
+
+    Only dict payloads with at least one large text field are split; every
+    other result passes through untouched.
+    """
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not any(
+        isinstance(payload.get(key), str) and payload[key]
+        for key in _TEXT_BLOCK_FIELDS
+    ):
+        return None
+    envelope = {k: v for k, v in payload.items() if k not in _TEXT_BLOCK_FIELDS}
+    blocks: list[Any] = []
+    for key in _TEXT_BLOCK_FIELDS:
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            envelope[f"{key}_chars"] = len(value)
+            blocks.append(TextContent(type="text", text=value))
+    blocks.insert(
+        0,
+        TextContent(
+            type="text",
+            text=json.dumps(envelope, ensure_ascii=False, separators=(",", ":")),
+        ),
+    )
+    return blocks
+
+
+if ToolResult is not None:
+    from fastmcp.server.middleware import Middleware
+
+    class TextBlockOutputMiddleware(Middleware):
+        """Deliver large tool-result text fields as real-newline text blocks.
+
+        The tool functions keep returning plain dicts (the Python-level
+        contract used by direct callers and the test suite); this
+        transport-layer transform only shapes what MCP clients see.
+        """
+
+        async def on_call_tool(self, context: Any, call_next: Any) -> Any:
+            result = await call_next(context)
+            try:
+                content = getattr(result, "content", None)
+                if not content or len(content) != 1:
+                    return result
+                block = content[0]
+                if getattr(block, "type", None) != "text":
+                    return result
+                blocks = _split_text_blocks(block.text)
+                if blocks is None:
+                    return result
+                result.content = blocks
+            except Exception:  # never break a tool call for formatting
+                return result
+            return result
+
+    mcp.add_middleware(TextBlockOutputMiddleware())
+
+
 def _finalize_tool_envelope(
     result: Any, *, clamped: bool, ws_warning: str | None,
     timeout_cap: int | None = None,
@@ -2497,6 +2577,7 @@ async def rocq_start(
     preamble: str = "",
     force_restart: bool = False,
     timeout: int | None = 0,
+    goals_max_chars: int | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Start an interactive proof session — see goals, explore tactics.
@@ -2585,6 +2666,15 @@ async def rocq_start(
             None, 0, and negative values use the corresponding default;
             positive values below the cap are respected. Larger values
             are capped and the response includes ``clamped_timeout: <cap>``.
+        goals_max_chars: Per-call cap on each goal's text size
+            (default: ``ROCQ_MAX_GOAL_CHARS``, 12000).  Oversized goals are
+            clipped structurally: every hypothesis keeps its name and the
+            conclusion keeps its head+tail, only bodies are sliced, and each
+            cut carries an explicit ``[clipped N of M chars]`` marker.  Pass
+            ``-1`` for the full text (the response may then exceed the
+            host's tool-output limit).  The goal text arrives as its own
+            content block with real newlines; the first block is the JSON
+            envelope (``goals_chars`` = size of the text block).
 
     On theorem-not-found errors: response includes ``available_in_file:
     list[str]`` with the file's defined names (sorted, capped — see
@@ -2615,6 +2705,7 @@ async def rocq_start(
         preamble=preamble,
         force_restart=force_restart,
         timeout=effective_timeout,
+        goals_max_chars=goals_max_chars,
     )
     return _finalize_tool_envelope(
         result, clamped=clamped, ws_warning=ws_warning,
@@ -2633,6 +2724,7 @@ async def rocq_step_multi(
     from_state: int,
     include_warnings: bool = True,
     timeout: int = 0,
+    goals_max_chars: int | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Try multiple tactics at once — find what works without guessing.
@@ -2685,6 +2777,12 @@ async def rocq_step_multi(
             lock indefinitely; when clamping fires the response includes
             ``clamped_timeout: <cap>`` so the caller can diagnose
             unexpected timeouts.
+        goals_max_chars: Per-call cap on each goal's text size in every
+            result entry (default: ``ROCQ_MAX_GOAL_CHARS``, 12000).
+            Oversized goals are clipped structurally (hypothesis names and
+            the conclusion head+tail survive; bodies are sliced with an
+            explicit ``[clipped N of M chars]`` marker).  Pass ``-1`` for
+            the full text.
 
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
@@ -2700,6 +2798,7 @@ async def rocq_step_multi(
         from_state=from_state,
         include_warnings=include_warnings,
         timeout=effective_timeout,
+        goals_max_chars=goals_max_chars,
     )
     if clamped:
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
@@ -2718,6 +2817,7 @@ async def rocq_check(
     workspace: str = "",
     timeout: int = 0,
     include_warnings: bool = True,
+    goals_max_chars: int | None = None,
     ctx: Context = None,
 ) -> dict[str, Any]:
     """Run proof commands from cached imports — fast iterative checking.
@@ -2782,6 +2882,14 @@ async def rocq_check(
             unexpected timeouts.
         include_warnings: If True (default), per-step ``feedback`` includes
             all severities.  If False, drop entries at LSP Warning severity.
+        goals_max_chars: Per-call cap on each goal's text size
+            (default: ``ROCQ_MAX_GOAL_CHARS``, 12000).  Oversized goals are
+            clipped structurally (hypothesis names and the conclusion
+            head+tail survive; bodies are sliced with an explicit
+            ``[clipped N of M chars]`` marker).  Pass ``-1`` for the full
+            text.  Goal text arrives as its own content block with real
+            newlines; the first block is the JSON envelope
+            (``goals_chars`` / ``goals_at_failure_chars`` = text sizes).
 
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
@@ -2799,6 +2907,7 @@ async def rocq_check(
         from_state=from_state,
         timeout=effective_timeout,
         include_warnings=include_warnings,
+        goals_max_chars=goals_max_chars,
     )
     if clamped and isinstance(result, dict):
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
