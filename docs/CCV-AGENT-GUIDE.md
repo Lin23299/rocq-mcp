@@ -45,7 +45,7 @@ budgets and recovery behaviour:
 | `ROCQ_MAX_PET_RSS_MB` | computed | RSS watchdog: when a pet exceeds it, it is **restarted** (all state ids die). |
 | `ROCQ_MAX_GOAL_CHARS` | `12000` | Per-goal clipping threshold. |
 | `ROCQ_MAX_GOALS_TOTAL_CHARS` | `40000` | Total goal text per response. |
-| `ROCQ_MAX_STATES` | `1000` | LRU cap for retained states. |
+| `ROCQ_MAX_STATES` | `1000` | LRU cap for retained states (CCV deployments override to `256`). |
 | `ROCQ_COMPILE_MULTI_ERROR_CAP` | `20` | Max errors reported by the multi-error walker of `rocq_compile_file`. |
 | `ROCQ_COMPILE_MULTI_ERROR_TIMEOUT` | `5.0` | Per-error walker budget (seconds). |
 | `ROCQ_ENRICHMENT_TIMEOUT_CAP` | `5.0` | Budget for enriching compile results with goal state. |
@@ -116,6 +116,15 @@ document replay cost.
   (`ROCQ_MAX_STATES`) and the RSS watchdog (`ROCQ_MAX_PET_RSS_MB`, which restarts
   the pet). A restart invalidates **all** ids. Commit the proof file often and
   treat `pet_restarted` as "rebuild the ladder", not as data loss of your work.
+  **Which states survive:** one table per MCP process holds the most-recently
+  *used* states — creating a state or referencing it via `from_state=` promotes it
+  (MRU), so a parked baseline you keep reusing stays alive while unreferenced
+  history is evicted from the LRU end; ids are monotonic and never reused. CCV
+  deployments override the defaults (`ROCQ_MAX_PET_RSS_MB=16384`,
+  `ROCQ_MAX_STATES=256`), and both are read at server start. On long files, move
+  stable definitions/lemmas into a separate module that compiles to `.vo` and
+  `Require Import` it: the live document — and with it every state snapshot and
+  replay — gets smaller.
 - **In-file `Set Default Timeout` applies to MCP-run sentences too.** If a sentence
   hits it, the call fails with `Error: Timeout!` at that line — that is a proof
   engineering signal (split the sentence), not a tool malfunction.
