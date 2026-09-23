@@ -69,7 +69,9 @@ Installer: `scripts/mcp/switch_install.py` (in the CCV framework repo, branch
 fork's source under `<switch>/.ccv-mcp/src`, builds a venv
 (`<switch>/.ccv-mcp/venv`), and writes the `ccv-rocq-mcp` shim which exports
 `COQLIB`/`COQCORELIB`/`ROCQPATH` and the `ROCQ_*` budgets. It refuses to touch a
-switch that has live Rocq processes and snapshots the switch first.
+switch that has live Rocq processes and snapshots the switch first. On a machine
+without network access, pass `--ref-venv <existing venv>` to copy the dependency
+packages from a reference venv and install the server with `--no-deps`.
 
 **B. Isolated pin (CCV's model).** `build_demand.py --install` copies a patched
 `pet` and this server's source into a content-addressed directory under
