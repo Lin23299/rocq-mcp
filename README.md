@@ -13,6 +13,13 @@ An [MCP](https://modelcontextprotocol.io/) server for [Rocq](https://rocq-prover
 
 > **A note on this README.** The sections that follow are detailed reference documentation aimed primarily at **AI agents** consuming these tools (and the human operators briefing them).
 
+## CCV fork notes
+
+This branch also carries the changes and operational guidance from the CCV fork:
+bounded timeouts, goal clipping with real-newline text blocks, and the patterns
+that keep long autonomous proof runs alive (state ladder, verbatim feeding,
+budget accounting). See [`docs/CCV-AGENT-GUIDE.md`](docs/CCV-AGENT-GUIDE.md).
+
 ## Prerequisites
 
 - **Rocq / Coq** -- `coqc` must be on your `PATH`. If the workspace contains a `_RocqProject` or `_CoqProject` file, the server parses it for load-path flags (`-Q`, `-R`, `-I`). For **dune projects** (no `_CoqProject` but a `dune-project` file present), the server auto-detects load paths via `dune coq top` — or `dune rocq top` for modern `(using rocq ...)` projects — once per `(coq.theory ...)` / `(rocq.theory ...)` stanza, so multi-theory workspaces resolve cross-theory imports correctly, and writes a `_RocqProject` file in the workspace so that coq-lsp also picks them up. This generated file stays in the workspace and should be added to `.gitignore`. Otherwise it defaults to `-Q <workspace> Test`.
