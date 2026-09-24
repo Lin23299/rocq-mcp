@@ -67,7 +67,54 @@ class TestCheckStaleness:
         warning = _check_staleness(entry)
         assert warning is not None
         assert "modified" in warning.lower()
-        assert "stale" in warning.lower()
+        assert "rocq_start" in warning
+
+    def test_no_warning_for_touch_only_change(self, tmp_path):
+        """An mtime-only change with identical content is not stale."""
+        from rocq_mcp.interactive import _file_content_hash
+
+        f = tmp_path / "test.v"
+        f.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+        entry = _StateEntry(
+            state=None,
+            file="test.v",
+            theorem="t",
+            workspace=str(tmp_path),
+            parent_id=None,
+            tactic=None,
+            step=0,
+            file_mtime=os.path.getmtime(str(f)),
+            resolved_file=str(f),
+            file_hash=_file_content_hash(str(f)),
+        )
+        # Touch only: mtime changes, bytes stay identical.
+        os.utime(str(f), (time.time() + 10, time.time() + 10))
+        assert _check_staleness(entry) is None
+
+    def test_warning_when_hash_differs(self, tmp_path):
+        """A content change is stale even with a matching stored fingerprint."""
+        from rocq_mcp.interactive import _file_content_hash
+
+        f = tmp_path / "test.v"
+        f.write_text("Theorem t : True. Proof. exact I. Qed.\n")
+        entry = _StateEntry(
+            state=None,
+            file="test.v",
+            theorem="t",
+            workspace=str(tmp_path),
+            parent_id=None,
+            tactic=None,
+            step=0,
+            file_mtime=os.path.getmtime(str(f)),
+            resolved_file=str(f),
+            file_hash=_file_content_hash(str(f)),
+        )
+        f.write_text("Theorem t : True. Proof. exact I. Qed. (* x *)\n")
+        os.utime(str(f), (time.time() + 10, time.time() + 10))
+        warning = _check_staleness(entry)
+        assert warning is not None
+        assert "not tracked" in warning.lower()
+        assert "rocq_start" in warning
 
     def test_warning_on_deleted_file(self, tmp_path):
         """Warning when file has been deleted since session start."""
@@ -285,8 +332,8 @@ class TestStalenessInRunCheck:
         sys.modules.pop("pytanque", None)
 
     @pytest.mark.asyncio
-    async def test_stale_warning_in_success_response(self):
-        """run_check success result should include stale_warning."""
+    async def test_untracked_stale_state_runs_with_warning(self):
+        """Untracked file-backed states keep the warn-but-run fallback."""
         import rocq_mcp.server as _srv
         import rocq_mcp.interactive as _int
 
@@ -316,7 +363,7 @@ class TestStalenessInRunCheck:
 
     @pytest.mark.asyncio
     async def test_stale_warning_in_error_response(self):
-        """run_check error result should also include stale_warning."""
+        """A tactic failure on an untracked stale state still reports the warning."""
         import rocq_mcp.server as _srv
         import rocq_mcp.interactive as _int
         from pytanque import PetanqueError
@@ -347,6 +394,7 @@ class TestStalenessInRunCheck:
             )
 
         assert result["success"] is False
+        assert result["reason"] == "tactic_failed"
         assert "stale_warning" in result
         assert "modified" in result["stale_warning"].lower()
 

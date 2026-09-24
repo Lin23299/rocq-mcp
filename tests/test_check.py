@@ -319,13 +319,17 @@ class TestCheckEdgeCases:
         """Call run_check with a state ID that has never existed; expect a
         clear 'does not exist' error.  Replaces the previous 'no active
         state' test from when ``from_state`` was optional."""
+        import rocq_mcp.interactive as _interactive
         from rocq_mcp.interactive import run_check
 
+        # Ids are seeded per process (never reused across restarts), so an
+        # id beyond the counter is the robust "never existed" probe.
+        never_issued = _interactive._state_next_id + 10_000
         cr = await run_check(
             body="intros.",
             timeout=30.0,
             lifespan_state=lifespan_state,
-            from_state=999999,
+            from_state=never_issued,
         )
         assert cr["success"] is False
         assert "error" in cr

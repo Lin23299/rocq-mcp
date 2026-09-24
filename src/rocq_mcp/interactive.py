@@ -425,6 +425,21 @@ class _StateEntry:
     proof_finished: bool = False
     file_mtime: float | None = None  # mtime at session creation
     resolved_file: str | None = None  # absolute path for staleness check
+    # Content fingerprint at session creation; disambiguates an mtime-only
+    # change (touch) from a real content change.  None for states created
+    # without a fingerprint (preamble states, legacy paths).
+    file_hash: str | None = None
+    # ---- file-progress bookkeeping -------------------------------------
+    # A session rooted at a position/theorem start keeps a snapshot of the
+    # backing file's text.  ``consumed`` is the byte offset into that snapshot
+    # that this state's lineage has *verifiably* executed (advanced only when
+    # a fed command matches the snapshot text); states whose consumed offset
+    # reaches past a file edit are invalidated and dropped.  ``session_root``
+    # is the root state id owning the snapshot (None = untracked, e.g.
+    # preamble states).
+    session_root: int | None = None
+    consumed: int | None = None
+    file_faithful: bool | None = None  # last command matched the snapshot text
     # Workspace .vo epoch when this session's environment was established
     # (inherited from the parent state so the whole lineage shares the root's
     # value).  Compared against the current epoch to detect a dependency .vo
@@ -435,13 +450,65 @@ class _StateEntry:
     created_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class _FileSnapshot:
+    """Text of a session's backing file, captured at session creation."""
+
+    path: str
+    text: str
+
+
+@dataclass
+class _InvalidatedState:
+    """Tombstone for a state dropped by a file edit (carries the resume hint)."""
+
+    state_id: int
+    resume_from: int | None
+    resume_at: dict[str, Any] | None
+    reason: str
+
+
+# Per-session file snapshots, keyed by root state id.  Freed when the root
+# leaves the table.
+_session_snapshots: dict[int, _FileSnapshot] = {}
+# Bounded FIFO of states dropped by file edits, so a later reference can be
+# answered with a structured resume hint instead of a generic "expired".
+_invalidated_tombstones: "OrderedDict[int, _InvalidatedState]" = OrderedDict()
+_MAX_TOMBSTONES = 512
+
+
 # LRU-ordered: ``_state_get`` / ``_state_get_or_error`` move accessed
 # entries to the most-recently-used end; eviction pops from the
 # least-recently-used end.  Keeps actively-used states alive even when
 # a parallel caller is churning through fresh states (e.g. two sub-agents
 # on different files sharing one rocq-mcp process).
 _state_table: "OrderedDict[int, _StateEntry]" = OrderedDict()
-_state_next_id: int = 1
+
+
+def _initial_state_id_seed() -> int:
+    """Per-process start for state ids — never reuse ids across restarts.
+
+    An agent may still hold state ids from a *previous* MCP-server process
+    (hot reconnect, crash restart).  If the counter restarted at 1, a
+    recycled id would silently resolve to a different state.  Within a
+    process ids stay monotonic and are not reset by invalidation.  Set
+    ``ROCQ_STATE_ID_SEED`` for deterministic ids (tests/debugging).
+    """
+    env = os.environ.get("ROCQ_STATE_ID_SEED")
+    if env and env.isdigit():
+        return max(1, int(env))
+    return 1 + int.from_bytes(os.urandom(4), "big") % (2**30)
+
+
+_state_next_id: int = _initial_state_id_seed()
+
+
+def _drop_snapshot_if_unreferenced(state_id: int) -> None:
+    """Free a session snapshot once no table entry references it."""
+    if state_id in _session_snapshots and not any(
+        e.session_root == state_id for e in _state_table.values()
+    ):
+        _session_snapshots.pop(state_id, None)
 
 
 def _state_add(
@@ -455,6 +522,10 @@ def _state_add(
     *,
     file_mtime: float | None = None,
     resolved_file: str | None = None,
+    file_hash: str | None = None,
+    session_root: int | None = None,
+    consumed: int | None = None,
+    file_faithful: bool | None = None,
     vo_epoch: int | None = None,
 ) -> int:
     """Add a state to the table and return its integer ID.
@@ -480,11 +551,16 @@ def _state_add(
         proof_finished=getattr(state, "proof_finished", False),
         file_mtime=file_mtime,
         resolved_file=resolved_file,
+        file_hash=file_hash,
+        session_root=session_root,
+        consumed=consumed,
+        file_faithful=file_faithful,
         vo_epoch=effective_epoch,
     )
     # Evict LRU entries when table exceeds max size.
     while len(_state_table) > _MAX_STATES:
-        _state_table.popitem(last=False)
+        evicted_id, _ = _state_table.popitem(last=False)
+        _drop_snapshot_if_unreferenced(evicted_id)
     return sid
 
 
@@ -502,8 +578,9 @@ def _state_get(state_id: int) -> _StateEntry | None:
 
 
 def _state_remove(state_id: int) -> None:
-    """Drop a state from the table."""
+    """Drop a state from the table (frees a session snapshot if unreferenced)."""
     _state_table.pop(state_id, None)
+    _drop_snapshot_if_unreferenced(state_id)
 
 
 def _state_get_or_error(state_id: int) -> tuple[_StateEntry | None, str | None]:
@@ -532,6 +609,274 @@ def _state_get_or_error(state_id: int) -> tuple[_StateEntry | None, str | None]:
 def _state_invalidate_all() -> None:
     """Clear all states (called on pet crash/invalidation)."""
     _state_table.clear()
+    _session_snapshots.clear()
+    _invalidated_tombstones.clear()
+
+
+# ---------------------------------------------------------------------------
+# File-progress bookkeeping (the tool is a bookkeeper, not a replayer)
+#
+# Each session rooted at a position/theorem start keeps a snapshot of the
+# backing file.  Every state records how far into that snapshot its lineage
+# has verifiably executed (``consumed``).  When the file changes on disk, the
+# first differing byte is computed; states whose consumed offset reaches past
+# it are *dropped* (they depend on text that changed), everything before it
+# survives and stays usable.  The dropped states leave a tombstone so a later
+# reference can answer with a structured resume hint: the nearest surviving
+# state plus the file position to continue feeding from.  The tool never
+# re-runs anything — the caller resumes with the file's sentences.
+# ---------------------------------------------------------------------------
+
+
+def _read_file_text(path: str) -> str | None:
+    """Read a file as text (best effort; None when unreadable)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _first_difference(old: str, new: str) -> int:
+    """Index of the first differing character (min length if one is a prefix)."""
+    limit = min(len(old), len(new))
+    i = 0
+    while i < limit and old[i] == new[i]:
+        i += 1
+    return i
+
+
+def _offset_to_line_col(text: str, offset: int) -> tuple[int, int]:
+    """Translate a character offset into 0-indexed (line, character)."""
+    offset = max(0, min(offset, len(text)))
+    line = text.count("\n", 0, offset)
+    last_nl = text.rfind("\n", 0, offset)
+    return line, offset - (last_nl + 1)
+
+
+def _line_col_to_offset(text: str, line: int, character: int) -> int:
+    """Translate 0-indexed (line, character) into a character offset."""
+    if line <= 0:
+        return max(0, min(character, len(text)))
+    idx = 0
+    for _ in range(line):
+        nl = text.find("\n", idx)
+        if nl < 0:
+            return len(text)
+        idx = nl + 1
+    return min(len(text), idx + max(0, character))
+
+
+def _match_command_at(text: str, offset: int, cmd: str) -> int | None:
+    """Token-wise match of *cmd* against *text* starting at *offset*.
+
+    Whitespace (including newlines) is flexible; every non-whitespace token
+    of *cmd* must appear verbatim and on a token boundary.  Returns the raw
+    offset just past the last matched token, or None when the command is not
+    recognized as the file's text at that position (a variant/edited body) —
+    the caller then keeps the previous offset instead of advancing.
+    """
+    tokens = cmd.split()
+    if not tokens:
+        return None
+    i = offset
+    n = len(text)
+    for tok in tokens:
+        while i < n and text[i].isspace():
+            i += 1
+        if not text.startswith(tok, i):
+            return None
+        i += len(tok)
+        if i < n and not (text[i].isspace() or text[i] == ")"):
+            # Token boundary required: avoids matching a token that is only a
+            # prefix of the file's identifier/punctuation run.  A closing
+            # paren is accepted because commands may end before ``)``.
+            return None
+    return i
+
+
+def _sentence_end_offset(text: str, offset: int) -> int:
+    """Conservative end of the sentence containing/starting after *offset*.
+
+    Scans forward for a ``.`` at bracket depth 0 outside comments/strings
+    followed by whitespace/EOF.  Errs on the late side — an over-estimate
+    only invalidates more states, never fewer — so imperfect handling of
+    exotic Coq syntax stays sound.
+    """
+    i = offset
+    n = len(text)
+    depth = 0
+    comment = 0
+    in_string = False
+    while i < n:
+        c = text[i]
+        if in_string:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            i += 1
+            continue
+        if comment > 0:
+            if text.startswith("(*", i):
+                comment += 1
+                i += 2
+                continue
+            if text.startswith("*)", i):
+                comment -= 1
+                i += 2
+                continue
+            i += 1
+            continue
+        if text.startswith("(*", i):
+            comment = 1
+            i += 2
+            continue
+        if c == '"':
+            in_string = True
+            i += 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(0, depth - 1)
+        elif c == "." and depth == 0:
+            if i + 1 >= n or text[i + 1].isspace():
+                return i + 1
+        i += 1
+    return n
+
+
+def _anchor_consumed(text: str, line: int, character: int) -> int:
+    """Dependency end offset for a position anchor.
+
+    pet rounds forward: a cursor in the whitespace before a sentence yields
+    the state *before* it (dependency ends at/before the cursor — using the
+    cursor offset is a safe slight over-estimate); a cursor inside a sentence
+    yields the state *after* it (dependency ends at the sentence terminator,
+    found by the conservative scanner).
+    """
+    offset = _line_col_to_offset(text, line, character)
+    prev_end = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        end = _sentence_end_offset(text, i)
+        if end > offset:
+            break
+        prev_end = end
+        if end >= n:
+            break
+        i = end
+    if text[prev_end:offset].strip() == "":
+        return offset
+    return _sentence_end_offset(text, offset)
+
+
+def _record_tombstone(
+    state_id: int,
+    resume_from: int | None,
+    resume_at: dict[str, Any] | None,
+    reason: str,
+) -> None:
+    """Remember a dropped state so later references get a resume hint."""
+    _invalidated_tombstones[state_id] = _InvalidatedState(
+        state_id=state_id,
+        resume_from=resume_from,
+        resume_at=resume_at,
+        reason=reason,
+    )
+    while len(_invalidated_tombstones) > _MAX_TOMBSTONES:
+        _invalidated_tombstones.popitem(last=False)
+
+
+def _refresh_session_for(entry: _StateEntry) -> None:
+    """Reconcile *entry*'s session with disk and drop invalidated states.
+
+    On a real content change: compute the first differing byte; drop every
+    state of the session whose consumed offset reaches past it (with a
+    tombstone carrying the nearest surviving ancestor + resume position);
+    then refresh the snapshot to the current text.  Surviving states are
+    untouched — their dependency prefix is byte-identical.
+    """
+    root = entry.session_root
+    if root is None or entry.consumed is None:
+        return
+    snap = _session_snapshots.get(root)
+    if snap is None:
+        return
+    current = _read_file_text(snap.path)
+    if current is None or current == snap.text:
+        return
+    first_diff = _first_difference(snap.text, current)
+    doomed = [
+        sid
+        for sid, e in list(_state_table.items())
+        if e.session_root == root
+        and e.consumed is not None
+        and e.consumed > first_diff
+    ]
+    if not doomed:
+        return
+    doomed_set = set(doomed)
+    for sid in doomed:
+        e = _state_table.get(sid)
+        if e is None:
+            continue
+        p = e.parent_id
+        while p is not None and p in doomed_set:
+            parent_entry = _state_table.get(p)
+            p = parent_entry.parent_id if parent_entry is not None else None
+        resume_from = p if (p is not None and p in _state_table) else None
+        base = _state_table.get(resume_from) if resume_from is not None else None
+        base_consumed = (
+            base.consumed if base is not None and base.consumed is not None else 0
+        )
+        line, character = _offset_to_line_col(current, base_consumed)
+        resume_at = {
+            "file": e.file,
+            "offset": base_consumed,
+            "line": line,
+            "character": character,
+            "line_text": _read_line_text(snap.path, line),
+        }
+        _record_tombstone(sid, resume_from, resume_at, "file_edited")
+    for sid in doomed:
+        _state_remove(sid)
+    snap.text = current
+
+
+def _invalidated_response(
+    from_state: int,
+    lifespan_state: dict[str, Any] | None,
+    tool: str,
+) -> dict[str, Any] | None:
+    """Structured answer when *from_state* was dropped by a file edit."""
+    inv = _invalidated_tombstones.get(from_state)
+    if inv is None:
+        return None
+    at = inv.resume_at or {}
+    hint = (
+        f"State {from_state} was invalidated because its backing file was "
+        f"edited after that state was created; every state reaching past the "
+        f"edit point was dropped (nothing was re-run, nothing executed on a "
+        f"stale prefix). Nearest surviving state: {inv.resume_from}. Resume by "
+        f"feeding the file's sentences from line {at.get('line')}, character "
+        f"{at.get('character')} (offset {at.get('offset')}) onward — then "
+        f"continue as usual."
+    )
+    if lifespan_state is not None:
+        _server._record_error(lifespan_state, tool, hint, reason="state_invalidated")
+    return {
+        "success": False,
+        "reason": "state_invalidated",
+        "error": hint,
+        "invalidated": True,
+        "resume_from": inv.resume_from,
+        "resume_at": inv.resume_at,
+        "hint": hint,
+    }
 
 
 def _resolve_check_base_state(
@@ -548,6 +893,39 @@ def _resolve_check_base_state(
     if err:
         return None, None, err
     return entry, from_state, None
+
+
+def _file_content_hash(path: str) -> str | None:
+    """Best-effort sha256 of a file's bytes (None when unreadable).
+
+    Used to disambiguate an mtime-only change (touch / rewrite-identical)
+    from a real content change before declaring a held state stale.
+    """
+    try:
+        import hashlib
+
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _read_line_text(path: str, line: int, cap: int = 200) -> str | None:
+    """Return the (truncated) text of a 0-indexed line, or None if unreadable.
+
+    Display-only helper for anchor self-description; never raises.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for idx, text in enumerate(fh):
+                if idx == line:
+                    return text.rstrip("\n")[:cap]
+    except OSError:
+        return None
+    return None
 
 
 def _check_staleness(
@@ -568,7 +946,14 @@ def _check_staleness(
     Returns a warning message on the first hit, or None if fresh.  Preamble
     states (no backing file) skip check 1 but are still covered by check 2.
     """
-    if entry.resolved_file is not None and entry.file_mtime is not None:
+    if (
+        entry.resolved_file is not None
+        and entry.file_mtime is not None
+        and entry.session_root is None
+    ):
+        # Tracked sessions (session_root set) handle file changes by precise
+        # invalidation in _refresh_session_for; the mtime warning below is
+        # the fallback for untracked file-backed entries only.
         try:
             current_mtime = os.path.getmtime(entry.resolved_file)
         except OSError:
@@ -578,10 +963,18 @@ def _check_staleness(
                 f"Use rocq_start to begin a fresh session."
             )
         if current_mtime != entry.file_mtime:
+            # An mtime change with byte-identical content (touch, rewrite)
+            # is not stale proof-wise: confirm via the stored fingerprint.
+            if entry.file_hash:
+                current_hash = _file_content_hash(entry.resolved_file)
+                if current_hash is not None and current_hash == entry.file_hash:
+                    return None
             return (
-                f"File '{entry.file}' has been modified since session start. "
-                f"The proof state may be stale. "
-                f"Use rocq_start to begin a fresh session."
+                f"File '{entry.file}' has been modified since this state's "
+                f"session was created and this state is not tracked by file "
+                f"progress, so the held proof state may no longer match disk. "
+                f"Re-anchor with rocq_start(file=..., line=...) on the "
+                f"current file."
             )
     if (
         lifespan_state is not None
@@ -754,10 +1147,27 @@ async def run_query(
         if from_state is not None:
             entry, base_id, err = _resolve_check_base_state(from_state)
             if err or entry is None:
+                resp = _invalidated_response(
+                    from_state, lifespan_state, "rocq_query"
+                )
+                if resp is not None:
+                    return resp
                 return _server._fail(
                     lifespan_state,
                     "rocq_query",
                     err or f"State {from_state} not found.",
+                )
+            _refresh_session_for(entry)
+            if _state_table.get(base_id) is None:
+                resp = _invalidated_response(base_id, lifespan_state, "rocq_query")
+                if resp is not None:
+                    return resp
+                return _server._fail(
+                    lifespan_state,
+                    "rocq_query",
+                    f"State {base_id} was invalidated by a file edit; re-anchor "
+                    f"with rocq_start(file=..., line=...).",
+                    reason="state_invalidated",
                 )
             state = entry.state
             from_state_id = base_id
@@ -1499,12 +1909,19 @@ def _build_position_start_result(
 
     file_mtime: float | None = None
     tracked_file: str | None = None
+    file_hash: str | None = None
+    file_text: str | None = None
+    consumed: int | None = None
     if track_staleness:
         try:
             file_mtime = os.path.getmtime(resolved_file)
         except OSError:
             file_mtime = None
         tracked_file = resolved_file
+        file_hash = _file_content_hash(resolved_file)
+        file_text = _read_file_text(resolved_file)
+        if file_text is not None:
+            consumed = _anchor_consumed(file_text, line, character)
 
     theorem = f"@pos({line},{character})"
     goals, focus_depth = _try_get_goals_with_depth(pet, state, goals_max_chars)
@@ -1518,8 +1935,15 @@ def _build_position_start_result(
         step=0,
         file_mtime=file_mtime,
         resolved_file=tracked_file,
+        file_hash=file_hash,
+        consumed=consumed,
         vo_epoch=_server._current_vo_epoch(lifespan_state, workspace),
     )
+    if file_text is not None and consumed is not None:
+        _session_snapshots[state_id] = _FileSnapshot(
+            path=resolved_file, text=file_text
+        )
+        _state_table[state_id].session_root = state_id
     result: dict[str, Any] = {
         "success": True,
         "state_id": state_id,
@@ -1530,6 +1954,20 @@ def _build_position_start_result(
     }
     if focus_depth is not None:
         result["focus_depth"] = focus_depth
+    if track_staleness:
+        # Self-describing anchor: echo which line the cursor actually pointed
+        # at (0-indexed) plus the file fingerprint, so the caller can confirm
+        # it did not anchor to an unintended sentence after edits shifted
+        # the line numbers.
+        result["anchor"] = {
+            "file": file,
+            "line": line,
+            "character": character,
+            "line_text": _read_line_text(resolved_file, line),
+            "file_mtime": file_mtime,
+            "file_hash": file_hash,
+            "consumed": consumed,
+        }
     return result
 
 
@@ -1582,6 +2020,11 @@ def _build_theorem_start_result(
         file_mtime: float | None = os.path.getmtime(resolved_file)
     except OSError:
         file_mtime = None
+    file_hash = _file_content_hash(resolved_file)
+    # A theorem start has no cursor offset; treat the whole file as the
+    # dependency (any content change drops the session's states).
+    file_text = _read_file_text(resolved_file)
+    consumed = len(file_text) if file_text is not None else None
     goals, focus_depth = _try_get_goals_with_depth(pet, state, goals_max_chars)
     state_id = _state_add(
         state=state,
@@ -1593,8 +2036,15 @@ def _build_theorem_start_result(
         step=0,
         file_mtime=file_mtime,
         resolved_file=resolved_file,
+        file_hash=file_hash,
+        consumed=consumed,
         vo_epoch=_server._current_vo_epoch(lifespan_state, workspace),
     )
+    if file_text is not None and consumed is not None:
+        _session_snapshots[state_id] = _FileSnapshot(
+            path=resolved_file, text=file_text
+        )
+        _state_table[state_id].session_root = state_id
     result: dict[str, Any] = {
         "success": True,
         "state_id": state_id,
@@ -1806,6 +2256,7 @@ def _run_one_check_command(
     *,
     entry: _StateEntry,
     prev_state_id: int,
+    base_state_id: int,
     command_index: int,
     total_commands: int,
     is_single: bool,
@@ -1848,6 +2299,22 @@ def _run_one_check_command(
             if fb_text is not None:
                 feedback_entry = [cmd, fb_text]
 
+        # Verify this command against the session's file snapshot: a verbatim
+        # file sentence advances the consumed offset, anything else (variant
+        # body, edited text) does not — the state then keeps the parent's
+        # offset and is flagged as not file-faithful.
+        faithful: bool | None = None
+        new_consumed = entry.consumed
+        if entry.session_root is not None and entry.consumed is not None:
+            snap = _session_snapshots.get(entry.session_root)
+            if snap is not None:
+                advanced = _match_command_at(snap.text, entry.consumed, cmd)
+                if advanced is not None:
+                    new_consumed = advanced
+                    faithful = True
+                else:
+                    faithful = False
+
         new_state_id = _state_add(
             state=new_state,
             file=entry.file,
@@ -1858,6 +2325,10 @@ def _run_one_check_command(
             step=entry.step + command_index + 1,
             file_mtime=entry.file_mtime,
             resolved_file=entry.resolved_file,
+            file_hash=entry.file_hash,
+            session_root=entry.session_root,
+            consumed=new_consumed,
+            file_faithful=faithful,
             # Inherit the lineage epoch (fallback if the immediate parent was
             # evicted); _state_add still prefers the live parent's value.
             vo_epoch=entry.vo_epoch,
@@ -1877,6 +2348,7 @@ def _run_one_check_command(
             failed_command=cmd,
             command_index=command_index,
             last_valid_state_id=prev_state_id,
+            base_state_id=base_state_id,
             goals_at_failure=_try_get_goals(pet, state, goals_max_chars),
             feedback_pairs=feedback_pairs,
             stale_warning=stale_warning,
@@ -1890,6 +2362,7 @@ def _build_check_failure_dict(
     failed_command: str,
     command_index: int,
     last_valid_state_id: int | None,
+    base_state_id: int | None,
     goals_at_failure: str | None,
     feedback_pairs: list[list[str]],
     stale_warning: str | None,
@@ -1899,7 +2372,15 @@ def _build_check_failure_dict(
     Tags ``reason="tactic_failed"`` so the unified envelope is consistent:
     agents can programmatically distinguish "your tactic was rejected by
     Coq" from a transport-level ``"crashed"`` (pet died) or ``"timeout"``.
+
+    ``partial`` marks the case where commands already ran before the
+    failure: ``last_valid_state_id`` then sits mid-body, corresponds to no
+    file position, and must not be mistaken for "the state before the next
+    file sentence".  The hint only recommends resuming when no command had
+    run (``command_index == 0``); otherwise it points at the original base
+    state so a corrected body replays from the same anchor.
     """
+    partial = command_index > 0
     result: dict[str, Any] = {
         "success": False,
         "reason": "tactic_failed",
@@ -1908,16 +2389,30 @@ def _build_check_failure_dict(
         "command_index": command_index,
         "commands_run": command_index,
         "last_valid_state_id": last_valid_state_id,
+        "partial": partial,
         "goals_at_failure": goals_at_failure,
     }
     if feedback_pairs:
         result["feedback"] = feedback_pairs
     if stale_warning:
         result["stale_warning"] = stale_warning
-    if last_valid_state_id is not None:
+    if not partial and last_valid_state_id is not None:
         result["hint"] = (
+            f"No command ran; from_state={last_valid_state_id} is the "
+            f"unmodified base state. "
             f"Use rocq_check(body='...', from_state={last_valid_state_id}) "
             f"or rocq_step_multi(tactics=[...], from_state={last_valid_state_id})."
+        )
+    elif partial:
+        base = base_state_id if base_state_id is not None else "the original from_state"
+        result["hint"] = (
+            f"{command_index} command(s) already ran, so "
+            f"from_state={last_valid_state_id} is a PARTIAL state: it is not "
+            f"any file position and its prefix contains commands of the "
+            f"failed body. Re-issue the corrected body from the original "
+            f"from_state ({base}), or re-anchor with "
+            f"rocq_start(file=..., line=...) on the current file. Use "
+            f"rocq_step_multi(from_state={base}) for per-tactic outcomes."
         )
     return result
 
@@ -1933,6 +2428,7 @@ def _build_check_success_dict(
     feedback_pairs: list[list[str]],
     stale_warning: str | None,
     complete: Any,
+    file_progress: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the result dict for a successful ``run_check`` batch."""
     result: dict[str, Any] = {
@@ -1944,6 +2440,8 @@ def _build_check_success_dict(
         "state_id": state_id,
         "from_state_id": from_state_id,
     }
+    if file_progress is not None:
+        result["file_progress"] = file_progress
     if feedback_pairs:
         result["feedback"] = feedback_pairs
     if stale_warning:
@@ -2014,6 +2512,9 @@ async def run_check(
 
     entry, base_state_id, err = _resolve_check_base_state(from_state)
     if err:
+        resp = _invalidated_response(from_state, lifespan_state, "rocq_check")
+        if resp is not None:
+            return resp
         return _server._fail(lifespan_state, "rocq_check", err)
     assert entry is not None and base_state_id is not None  # err is None here
 
@@ -2046,6 +2547,22 @@ async def run_check(
                 re_err or "Internal: state lost.",
             )
 
+        # Reconcile this session with disk first: a real file edit drops the
+        # states reaching past the change (with resume tombstones) and keeps
+        # everything before it usable.  The tool never re-runs anything.
+        _refresh_session_for(entry_to_use)
+        if _state_table.get(base_state_id) is None:
+            resp = _invalidated_response(base_state_id, lifespan_state, "rocq_check")
+            if resp is not None:
+                return resp
+            return _server._fail(
+                lifespan_state,
+                "rocq_check",
+                f"State {base_state_id} was invalidated by a file edit and no "
+                f"resume hint is available; re-anchor with "
+                f"rocq_start(file=..., line=...) on the current file.",
+                reason="state_invalidated",
+            )
         stale_warning = _check_staleness(entry_to_use, lifespan_state)
         start_time = time.monotonic()
         _server._set_workspace_if_needed(pet, entry_to_use.workspace, lifespan_state)
@@ -2054,6 +2571,7 @@ async def run_check(
         prev_state_id = base_state_id
         feedback_pairs: list[list[str]] = []
         total_feedback_size = 0
+        faithful_flags: list[bool | None] = []
 
         for i, cmd in enumerate(commands):
             new_state, new_state_id, feedback_entry, failure = _run_one_check_command(
@@ -2062,6 +2580,7 @@ async def run_check(
                 cmd,
                 entry=entry_to_use,
                 prev_state_id=prev_state_id,
+                base_state_id=base_state_id,
                 command_index=i,
                 total_commands=len(commands),
                 is_single=is_single,
@@ -2080,6 +2599,9 @@ async def run_check(
                 total_feedback_size += len(feedback_entry[1])
             state = new_state
             prev_state_id = new_state_id
+            new_entry = _state_table.get(new_state_id)
+            if new_entry is not None and new_entry.session_root is not None:
+                faithful_flags.append(new_entry.file_faithful)
             partial_state["commands_run"] = i + 1
             partial_state["last_valid_state_id"] = new_state_id
 
@@ -2087,6 +2609,16 @@ async def run_check(
 
         complete = pet.complete_goals(state)
         goals_text = _format_complete_goals(complete, max_chars=goals_max_chars)
+
+        file_progress: dict[str, Any] | None = None
+        final_entry = _state_table.get(prev_state_id)
+        if final_entry is not None and final_entry.session_root is not None:
+            file_progress = {
+                "consumed": final_entry.consumed,
+                "file_faithful": all(f is not False for f in faithful_flags)
+                if faithful_flags
+                else None,
+            }
 
         return _build_check_success_dict(
             goals_text=goals_text,
@@ -2098,6 +2630,7 @@ async def run_check(
             feedback_pairs=feedback_pairs,
             stale_warning=stale_warning,
             complete=complete,
+            file_progress=file_progress,
         )
 
     # Timeout strategy: both single and multi-command use two-tier when eligible
@@ -2168,6 +2701,9 @@ async def run_step_multi(
     # Re-validated inside _execute (state may be invalidated between checks).
     _, _, err = _resolve_check_base_state(from_state)
     if err:
+        resp = _invalidated_response(from_state, lifespan_state, "rocq_step_multi")
+        if resp is not None:
+            return resp
         return _server._fail(lifespan_state, "rocq_step_multi", err)
 
     # Shared list so partial results survive a timeout via partial_state
@@ -2185,17 +2721,37 @@ async def run_step_multi(
         # Re-validate under lock — pet may have restarted since the outer check.
         entry_to_use, base_state_id, err = _resolve_check_base_state(from_state)
         if err or entry_to_use is None:
+            resp = _invalidated_response(
+                from_state, lifespan_state, "rocq_step_multi"
+            )
+            if resp is not None:
+                return resp
             return _server._fail(
                 lifespan_state,
                 "rocq_step_multi",
                 err or "Internal: state lost.",
             )
 
+        # Reconcile this session with disk first (see run_check): dropped
+        # states answer with a resume hint instead of exploring a stale prefix.
+        _refresh_session_for(entry_to_use)
+        if _state_table.get(base_state_id) is None:
+            resp = _invalidated_response(
+                base_state_id, lifespan_state, "rocq_step_multi"
+            )
+            if resp is not None:
+                return resp
+            return _server._fail(
+                lifespan_state,
+                "rocq_step_multi",
+                f"State {base_state_id} was invalidated by a file edit and no "
+                f"resume hint is available; re-anchor with "
+                f"rocq_start(file=..., line=...) on the current file.",
+                reason="state_invalidated",
+            )
+        stale_warning = _check_staleness(entry_to_use, lifespan_state)
         _server._set_workspace_if_needed(pet, entry_to_use.workspace, lifespan_state)
         parent_state = entry_to_use.state
-
-        # Check for file staleness (non-blocking warning)
-        stale_warning = _check_staleness(entry_to_use, lifespan_state)
 
         total_feedback_size = 0
 

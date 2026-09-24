@@ -1230,6 +1230,10 @@ _RECENT_ERROR_REASONS: frozenset[str] = _PET_SIDE_FAILURE_REASONS | frozenset(
         "not_found",
         # rocq_check mid-batch failure (a tactic was rejected by Coq).
         "tactic_failed",
+        # rocq_check/rocq_step_multi/rocq_query referenced a state that was
+        # dropped because the backing file was edited (response carries
+        # resume_from / resume_at).
+        "state_invalidated",
         # rocq_verify-specific reasons (see compile.run_verify).
         "compile_error",
         "axiom_dependency",
@@ -2758,6 +2762,11 @@ async def rocq_step_multi(
     prefix inside every entry of ``tactics``.  See README
     "Recommended usage patterns → Multi-tactic exploration".
 
+    When the backing file was edited, states reaching past the change are
+    dropped; referencing one returns ``reason="state_invalidated"`` with
+    ``resume_from`` / ``resume_at`` (feed the file's sentences from there and
+    retry).  States before the change keep working.
+
     Args:
         tactics: List of tactics to try (max 20).
         from_state: State ID to try the tactics from.  Required — use the
@@ -2855,12 +2864,26 @@ async def rocq_check(
     retrieved, like the other goal-derived fields.)
 
     **Note:** A held ``state_id`` freezes its Rocq environment at session
-    start.  A ``stale_warning`` field is returned when that environment may
-    no longer match disk: either the underlying ``.v`` file was modified
-    after ``rocq_start``, or a dependency ``.vo`` in the workspace was
-    rebuilt through this server since the session began (in which case
-    ``proof_finished`` can diverge from a clean compile — re-verify with
-    ``rocq_compile_file``).  Restart with ``rocq_start`` for a fresh session.
+    start.  The tool tracks each state's *file progress* (how far into the
+    backing file its executed prefix reaches).  When the file is edited, only
+    the states reaching past the edit point are dropped — everything before
+    it stays usable, and referencing a dropped state returns
+    ``reason="state_invalidated"`` with ``resume_from`` (nearest surviving
+    state) and ``resume_at`` (line/character to continue feeding from).
+    Continue by feeding the file's sentences from ``resume_at`` onward; the
+    tool never re-runs anything itself.  Success responses carry
+    ``file_progress`` (``consumed`` offset + ``file_faithful`` — whether the
+    fed commands were recognized verbatim in the file).  Summaries of the
+    consumed offset also appear as ``anchor`` on position starts.  Separately,
+    when a dependency ``.vo`` in the workspace was rebuilt through this server
+    since the session began, a ``stale_warning`` field is returned (in which
+    case ``proof_finished`` can diverge from a clean compile — re-verify with
+    ``rocq_compile_file``).
+
+    On a mid-batch failure the envelope carries ``partial``: when true, some
+    commands already ran, so ``last_valid_state_id`` sits mid-body and is
+    **not** any file position; the ``hint`` then points at the original
+    ``from_state`` so a corrected body replays from the same anchor.
 
     Args:
         body: Commands to execute (one or more Rocq sentences).
@@ -2965,6 +2988,9 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
         ``"not_found"`` (rocq_start / rocq_assumptions on a typo).
       - **rocq_check mid-batch**: ``"tactic_failed"`` (a tactic was
         rejected by Coq — distinct from a transport-level ``"crashed"``).
+      - **Invalidated state**: ``"state_invalidated"`` (a referenced state
+        was dropped because the backing file was edited; the response carries
+        ``resume_from`` / ``resume_at`` so the caller can continue).
       - **rocq_verify-specific**: ``"compile_error"``,
         ``"axiom_dependency"``, ``"type_mismatch"``.
 

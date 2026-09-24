@@ -6,6 +6,8 @@ bypassing FastMCP Context injection.
 
 from __future__ import annotations
 
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -1124,9 +1126,9 @@ class TestQueryFromStateIntegration:
         self, workspace, lifespan_state
     ):
         """If the .v file backing a session is modified after rocq_start,
-        a subsequent from_state query must surface ``stale_warning`` so
-        the agent knows the proof state may not match the current
-        source — same contract as rocq_check."""
+        a subsequent from_state query must report the state as invalidated
+        (with a resume hint) instead of resolving symbols against a proof
+        state that no longer matches the source."""
         from rocq_mcp.interactive import _state_table, run_start
 
         vfile = Path(workspace) / "stale_query.v"
@@ -1141,10 +1143,14 @@ class TestQueryFromStateIntegration:
         assert start["success"] is True
         sid = start["state_id"]
 
-        # Mutate the file's mtime (simulate an out-of-band edit).
+        # Out-of-band edit: change the content (a theorem-started session
+        # depends on the whole file, so this drops the state).
+        vfile.write_text(
+            "Theorem stale_thm : True.\nProof. exact I. Qed. (* edited *)\n"
+        )
+        os.utime(str(vfile), (time.time() + 10, time.time() + 10))
         entry = _state_table[sid]
         assert entry.file_mtime is not None
-        entry.file_mtime = entry.file_mtime - 100  # pretend session is older
 
         result = await run_query(
             command="Check Nat.add.",
@@ -1153,9 +1159,10 @@ class TestQueryFromStateIntegration:
             lifespan_state=lifespan_state,
             from_state=sid,
         )
-        assert result["success"] is True
-        assert "stale_warning" in result
-        assert "modified" in result["stale_warning"].lower()
+        assert result["success"] is False
+        assert result["reason"] == "state_invalidated"
+        assert result["invalidated"] is True
+        assert result["resume_at"]["offset"] == 0
 
 
 # ---------------------------------------------------------------------------

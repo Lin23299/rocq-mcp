@@ -951,6 +951,7 @@ class TestExtraValidationRecording:
                 "validation",
                 "not_found",
                 "tactic_failed",
+                "state_invalidated",
                 "compile_error",
                 "axiom_dependency",
                 "type_mismatch",
