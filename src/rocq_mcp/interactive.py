@@ -22,6 +22,7 @@ Infrastructure:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -37,6 +38,11 @@ except ImportError:  # pragma: no cover - pytanque optional
     _PetanqueError = None  # type: ignore[assignment, misc]
 
 from rocq_mcp.verify import _check_forbidden_commands
+from rocq_mcp.output_store import MAX_READ_BYTES
+from rocq_mcp.output_contract import (
+    GOAL_GROUPS as _GOAL_GROUPS, GOAL_PARTS as _GOAL_PARTS,
+    RANGE_STATUS_DATA, RANGE_STATUS_EOF,
+)
 
 # Imports from server.py — these are all defined before server.py imports
 # interactive, so the circular import resolves cleanly.
@@ -90,7 +96,10 @@ def _truncate_result(text: str, max_length: int) -> str:
     return text[:max_length] + f"\n... (truncated, {len(text)} total chars)"
 
 
-def _extract_feedback(state: Any, *, include_warnings: bool = True) -> str | None:
+def _extract_feedback(
+    state: Any, *, include_warnings: bool = True,
+    max_length: int | None = _MAX_FEEDBACK_LENGTH,
+) -> str | None:
     """Extract non-empty feedback from a pytanque State, joined as a string.
 
     Returns *None* when there is nothing to report.  When
@@ -109,7 +118,7 @@ def _extract_feedback(state: Any, *, include_warnings: bool = True) -> str | Non
     if not msgs:
         return None
     raw = "\n".join(msgs)
-    return _truncate_result(raw, _MAX_FEEDBACK_LENGTH)
+    return raw if max_length is None else _truncate_result(raw, max_length)
 
 
 def _clip_middle(text: str, budget: int) -> str:
@@ -232,6 +241,290 @@ def _try_get_goals(
     """Return formatted goals or None for empty goals; propagate failures."""
     text, _ = _try_get_goals_with_depth(pet, state, max_chars)
     return text
+
+
+def _goal_group(complete: Any, group: str, depth: int | None) -> list[Any]:
+    if group in {"stack_left", "stack_right"}:
+        if type(depth) is not int or not 1 <= depth <= len(complete.stack):
+            raise ValueError("Stack goal group requires a valid 1-based depth.")
+        left, right = complete.stack[depth - 1]
+        return left if group == "stack_left" else right
+    if depth is not None:
+        raise ValueError("Only a stack goal group accepts depth.")
+    return {
+        "focused": complete.goals,
+        "shelved": complete.shelf,
+        "given_up": complete.given_up,
+    }[group]
+
+
+def _goal_ref(
+    goal: Any, entry: _StateEntry, lifespan_state: dict[str, Any],
+    state_id: int, group: str, depth: int | None, goal_index: int,
+) -> dict[str, Any]:
+    """Identify a goal within this document; the reference is not authorization."""
+    document = json.dumps({
+        "workspace": entry.workspace, "file": entry.file,
+        "file_hash": entry.file_hash, "vo_epoch": entry.vo_epoch,
+        "session_root": entry.session_root,
+    }, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256()
+
+    def add(text: str) -> None:
+        encoded = text.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+
+    add(goal.ty)
+    digest.update(len(goal.hyps).to_bytes(8, "big"))
+    for hyp in goal.hyps:
+        digest.update(len(hyp.names).to_bytes(8, "big"))
+        for name in hyp.names:
+            add(name)
+        add(hyp.ty)
+        add(hyp.def_ or "")
+    owner = lifespan_state.get("output_principal", "")
+    return {
+        "service_generation": owner, "owner_session": owner,
+        "state_id": state_id,
+        "document_identity": hashlib.sha256(document).hexdigest(),
+        "group": group, "depth": depth, "goal_index": goal_index,
+        "goal_digest": digest.hexdigest(),
+    }
+
+
+def _live_complete_goals(
+    pet: Any, from_state: int, lifespan_state: dict[str, Any], tool: str,
+) -> tuple[_StateEntry, Any] | dict[str, Any]:
+    # Step P7: Validate generation at the MCP boundary and file/dependency
+    # freshness here before selecting a goal; never register a new state.
+    current, _, err = _resolve_check_base_state(from_state)
+    if err or current is None:
+        return _invalidated_response(from_state, lifespan_state, tool) or _server._fail(
+            lifespan_state, tool, err or "Proof state was lost.",
+        )
+    _refresh_session_for(current)
+    if _state_table.get(from_state) is None:
+        return _invalidated_response(from_state, lifespan_state, tool) or _server._fail(
+            lifespan_state, tool, "Proof state invalidated by a file edit.",
+            reason="state_invalidated",
+        )
+    stale_warning = _check_staleness(current, lifespan_state)
+    if stale_warning:
+        return _server._fail(
+            lifespan_state, tool,
+            "Held state may not describe the current file/dependencies; re-anchor before inspecting goals.",
+            reason="state_invalidated", stale_warning=stale_warning,
+        )
+    _server._set_workspace_if_needed(pet, current.workspace, lifespan_state)
+    complete = pet.complete_goals(current.state)
+    if complete is None:
+        return _server._fail(lifespan_state, tool, "Goal data is unavailable.", reason="unavailable")
+    return current, complete
+
+
+def _invalid_goal_text(
+    current: _StateEntry, lifespan_state: dict[str, Any], state_id: int,
+    location: str, **metadata: Any,
+) -> dict[str, Any]:
+    """State retrieval succeeded; its printed view cannot be UTF-8 encoded."""
+    return {
+        "schema_version": 1, "success": True, "state_id": state_id,
+        "proof_finished": current.state.proof_finished,
+        "service_generation": lifespan_state.get("output_principal", ""),
+        "view_status": "partial_unrecoverable", "view_error_code": "invalid_text",
+        "error": "Live goal text cannot be encoded as UTF-8; no complete view is available.",
+        "views": {location: {
+            "location": location, "kind": "unavailable", "complete": False,
+            "total_bytes": None, "shown_bytes": 0, "reason": "invalid_text",
+        }},
+        **metadata,
+    }
+
+
+async def run_goal_part(
+    from_state: int,
+    group: str,
+    goal_index: int,
+    part: str,
+    lifespan_state: dict[str, Any],
+    *,
+    depth: int | None = None,
+    hyp_index: int | None = None,
+    offset_bytes: int = 0,
+    max_bytes: int = MAX_READ_BYTES,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Read one named component of a *registered* state, without advancing it."""
+    if group not in _GOAL_GROUPS or part not in _GOAL_PARTS:
+        return _server._fail(lifespan_state, "rocq_get_goal_part", "Unknown goal group or part.")
+    if (type(goal_index) is not int or goal_index < 1 or type(offset_bytes) is not int
+            or offset_bytes < 0 or type(max_bytes) is not int or not 1 <= max_bytes <= MAX_READ_BYTES):
+        return _server._fail(lifespan_state, "rocq_get_goal_part", "Invalid goal index or byte range.")
+    if part == "conclusion" and hyp_index is not None:
+        return _server._fail(lifespan_state, "rocq_get_goal_part", "Conclusion does not accept hyp_index.")
+    if part != "conclusion" and (type(hyp_index) is not int or hyp_index < 1):
+        return _server._fail(lifespan_state, "rocq_get_goal_part", "Hypothesis part requires hyp_index.")
+    entry, _, err = _resolve_check_base_state(from_state)
+    if err:
+        return _invalidated_response(from_state, lifespan_state, "rocq_get_goal_part") or _server._fail(
+            lifespan_state, "rocq_get_goal_part", err,
+        )
+    assert entry is not None
+
+    def _read_goal(pet: Any) -> dict[str, Any]:
+        resolved = _live_complete_goals(pet, from_state, lifespan_state, "rocq_get_goal_part")
+        if isinstance(resolved, dict):
+            return resolved
+        current, complete = resolved
+        try:
+            selected = _goal_group(complete, group, depth)
+        except ValueError as exc:
+            return _server._fail(lifespan_state, "rocq_get_goal_part", str(exc))
+        if goal_index > len(selected):
+            return _server._fail(lifespan_state, "rocq_get_goal_part", "Goal index is out of range.")
+        goal = selected[goal_index - 1]
+        if isinstance(goal, dict):
+            from pytanque.protocol import Goal
+            goal = Goal.from_json(goal)
+
+        if part == "conclusion":
+            text = goal.ty
+        else:
+            if hyp_index > len(goal.hyps):
+                return _server._fail(lifespan_state, "rocq_get_goal_part", "Hypothesis index is out of range.")
+            hyp = goal.hyps[hyp_index - 1]
+            if part == "names":
+                text = ", ".join(hyp.names)
+            elif part == "type":
+                text = hyp.ty
+            else:
+                if hyp.def_ is None:
+                    return _server._fail(lifespan_state, "rocq_get_goal_part", "Hypothesis has no definition.")
+                text = str(hyp.def_)
+        selector = {"group": group, "depth": depth, "goal_index": goal_index,
+                    "part": part, "hyp_index": hyp_index}
+        try:
+            source = text.encode("utf-8")
+            goal_ref = _goal_ref(goal, current, lifespan_state, from_state,
+                                 group, depth, goal_index)
+        except UnicodeError:
+            return _invalid_goal_text(current, lifespan_state, from_state, "text", selector=selector)
+        if offset_bytes > len(source):
+            return _server._fail(lifespan_state, "rocq_get_goal_part", "Byte offset is out of range.")
+        if offset_bytes < len(source) and source[offset_bytes] & 0xC0 == 0x80:
+            return _server._fail(lifespan_state, "rocq_get_goal_part", "Byte offset splits a UTF-8 character.")
+        end = min(len(source), offset_bytes + max_bytes)
+        if end < len(source):
+            while end > offset_bytes and source[end] & 0xC0 == 0x80:
+                end -= 1
+        if offset_bytes < len(source) and end == offset_bytes:
+            return _server._fail(lifespan_state, "rocq_get_goal_part",
+                                 "Range is too small for the next UTF-8 character.")
+        chunk = source[offset_bytes:end]
+        return {
+            "success": True, "state_id": from_state,
+            "proof_finished": current.state.proof_finished,
+            "selector": selector, "goal_ref": goal_ref,
+            "status": RANGE_STATUS_EOF if offset_bytes == len(source) else RANGE_STATUS_DATA,
+            "text": chunk.decode("utf-8"), "start": offset_bytes, "end": end,
+            "total_bytes": len(source), "digest": hashlib.sha256(source).hexdigest(),
+            "has_more": end < len(source),
+        }
+
+    return await _server._run_with_pet(
+        _read_goal, lifespan_state, "rocq_get_goal_part", timeout=timeout,
+        workspace=entry.workspace, from_state=from_state,
+    )
+
+
+async def run_goal_roster(
+    from_state: int, group: str, lifespan_state: dict[str, Any], *,
+    depth: int | None = None, cursor: int = 0, max_goals: int = 5,
+    max_hyps: int = 8, timeout: float | None = None,
+) -> dict[str, Any]:
+    """Page goal/hyp indices of an active state, not their potentially huge terms."""
+    if group not in _GOAL_GROUPS or type(cursor) is not int or cursor < 0:
+        return _server._fail(lifespan_state, "rocq_get_goal_roster", "Invalid group or cursor.")
+    if (type(max_goals) is not int or not 1 <= max_goals <= 5
+            or type(max_hyps) is not int or not 1 <= max_hyps <= 8):
+        return _server._fail(lifespan_state, "rocq_get_goal_roster", "Roster page size is out of range.")
+    entry, _, err = _resolve_check_base_state(from_state)
+    if err:
+        return _invalidated_response(from_state, lifespan_state, "rocq_get_goal_roster") or _server._fail(
+            lifespan_state, "rocq_get_goal_roster", err,
+        )
+    assert entry is not None
+
+    def _read_roster(pet: Any) -> dict[str, Any]:
+        resolved = _live_complete_goals(pet, from_state, lifespan_state, "rocq_get_goal_roster")
+        if isinstance(resolved, dict):
+            return resolved
+        current, complete = resolved
+        try:
+            selected = _goal_group(complete, group, depth)
+        except ValueError as exc:
+            return _server._fail(lifespan_state, "rocq_get_goal_roster", str(exc))
+        if cursor > len(selected):
+            return _server._fail(lifespan_state, "rocq_get_goal_roster", "Roster cursor is out of range.")
+        def _prefix(text: str, nbytes: int) -> tuple[str, bool]:
+            raw = text.encode("utf-8")
+            preview = raw[:nbytes].decode("utf-8", errors="ignore")
+            return preview, len(preview.encode("utf-8")) < len(raw)
+
+        rows = []
+        for number, goal in enumerate(selected[cursor:cursor + max_goals], cursor + 1):
+            if isinstance(goal, dict):
+                from pytanque.protocol import Goal
+                goal = Goal.from_json(goal)
+            try:
+                goal_ref = _goal_ref(goal, current, lifespan_state, from_state,
+                                     group, depth, number)
+                hyps = []
+                omitted_names = len(goal.hyps) > max_hyps
+                for index, hyp in enumerate(goal.hyps[:max_hyps], 1):
+                    preview, omitted = _prefix(", ".join(hyp.names), 64)
+                    hyps.append({"hyp_index": index, "names_preview": preview})
+                    omitted_names = omitted_names or omitted
+                conclusion_preview, omitted_conclusion = _prefix(goal.ty, 128)
+            except UnicodeError:
+                return _invalid_goal_text(
+                    current, lifespan_state, from_state, "roster",
+                    group=group, depth=depth, cursor=cursor,
+                )
+            rows.append({"goal_index": number, "hypotheses_total": len(goal.hyps),
+                         "hypotheses_preview": hyps,
+                         "hypotheses_preview_incomplete": omitted_names,
+                         "conclusion_preview": conclusion_preview,
+                         "conclusion_preview_incomplete": omitted_conclusion,
+                         "goal_ref": goal_ref})
+        end = cursor + len(rows)
+        stack = [
+            {"depth": idx, "left": len(left), "right": len(right)}
+            for idx, (left, right) in enumerate(complete.stack[:20], 1)
+        ]
+        result = {
+            "success": True, "state_id": from_state,
+            "proof_finished": current.state.proof_finished,
+            "group": group, "depth": depth, "cursor": cursor,
+            "goals": rows, "total_goals": len(selected),
+            "has_more": end < len(selected),
+            "roster_truncated": (cursor > 0 or end < len(selected) or len(complete.stack) > 20 or any(
+                row["hypotheses_preview_incomplete"] or row["conclusion_preview_incomplete"]
+                for row in rows
+            )),
+            "focused_goals": len(complete.goals), "focus_depth": len(complete.stack),
+            "stack_preview": stack, "stack_has_more": len(complete.stack) > len(stack),
+            "shelved_goals": len(complete.shelf), "given_up_goals": len(complete.given_up),
+        }
+        if result["has_more"]:
+            result["next_cursor"] = end
+        return result
+
+    return await _server._run_with_pet(
+        _read_roster, lifespan_state, "rocq_get_goal_roster", timeout=timeout,
+        workspace=entry.workspace, from_state=from_state,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +906,15 @@ def _state_invalidate_all() -> None:
     _invalidated_tombstones.clear()
 
 
+def _invalidate_workspace_states() -> None:
+    """Keep a bounded explanation for IDs invalidated by native refresh."""
+    ids = list(_state_table)[-_MAX_TOMBSTONES:]
+    _invalidate_import_cache()
+    _state_invalidate_all()
+    for sid in ids:
+        _record_tombstone(sid, None, None, "workspace_updated")
+
+
 # ---------------------------------------------------------------------------
 # File-progress bookkeeping (the tool is a bookkeeper, not a replayer)
 #
@@ -807,7 +1109,13 @@ def _refresh_session_for(entry: _StateEntry) -> None:
     if snap is None:
         return
     current = _read_file_text(snap.path)
-    if current is None or current == snap.text:
+    if current is None:
+        for sid, existing in list(_state_table.items()):
+            if existing.session_root == root:
+                _record_tombstone(sid, None, None, "file_unavailable")
+                _state_remove(sid)
+        return
+    if current == snap.text:
         return
     first_diff = _first_difference(snap.text, current)
     doomed = [
@@ -856,6 +1164,11 @@ def _invalidated_response(
     inv = _invalidated_tombstones.get(from_state)
     if inv is None:
         return None
+    if inv.reason in {"workspace_updated", "file_unavailable"}:
+        return {"success": False, "reason": "state_invalidated", "invalidated": True,
+                "error": ("Workspace was refreshed; start from saved source." if inv.reason == "workspace_updated"
+                          else "Backing file is missing or unreadable; restore it before starting again."),
+                "invalidation_cause": inv.reason}
     at = inv.resume_at or {}
     hint = (
         f"State {from_state} was invalidated because its backing file was "
@@ -1075,6 +1388,7 @@ async def run_query(
     timeout: float | None = None,
     from_state: int | None = None,
     auto_record: bool = True,
+    capture_feedback: bool = False,
 ) -> dict[str, Any]:
     """Core implementation of rocq_query (testable without FastMCP Context).
 
@@ -1212,18 +1526,31 @@ async def run_query(
                 (lvl, msg) for lvl, msg in feedback if lvl != _LSP_SEVERITY_WARNING
             ]
 
+        # Step P1: Capture every filtered message before the displayed subset
+        # is selected.  The caller moves any required snapshot to disk after
+        # _run_with_pet releases the Pet lock; no filesystem I/O happens here.
         # 只应用显式结果条数限制；query 文本不按字符裁剪。
         total_results = len(feedback)
+        all_feedback = feedback
         if max_results is not None and max_results > 0 and total_results > max_results:
             feedback = feedback[:max_results]
 
         output = "\n".join(msg for _, msg in feedback)
+        shown_output = output
+        all_output = (
+            output if len(feedback) == total_results else "\n".join(msg for _, msg in all_feedback)
+        ) if capture_feedback else None
         if max_results is not None and max_results > 0 and total_results > max_results:
             output += (
                 f"\n... ({total_results - max_results} more results, "
                 f"{total_results} total)"
             )
         resp: dict[str, Any] = {"success": True, "output": output or "(no output)"}
+        if capture_feedback:
+            resp["_all_feedback"] = all_output
+            resp["_shown_feedback"] = shown_output
+            resp["_feedback_messages"] = total_results
+            resp["_shown_messages"] = len(feedback)
         if from_state_id is not None:
             resp["from_state_id"] = from_state_id
         if stale_warning:
@@ -1236,6 +1563,7 @@ async def run_query(
         "rocq_query",
         timeout=timeout,
         auto_record=auto_record,
+        workspace=workspace, from_state=from_state,
     )
 
 
@@ -1723,6 +2051,7 @@ async def _fetch_available_in_file(
         lifespan_state,
         tool,
         auto_record=False,
+        workspace=workspace,
     )
     if isinstance(names, dict):
         return names
@@ -1737,6 +2066,7 @@ async def run_toc(
     lifespan_state: dict[str, Any],
     *,
     timeout: float | None = None,
+    capture_output: bool = False,
 ) -> dict[str, Any]:
     """Core implementation of rocq_toc (testable without FastMCP Context).
 
@@ -1761,18 +2091,26 @@ async def run_toc(
                 lines.extend(_format_toc_elements(elements))
 
         output = "\n".join(lines)
+        original = output
+        shown = output[:_MAX_QUERY_OUTPUT]
         if len(output) > _MAX_QUERY_OUTPUT:
             output = (
                 output[:_MAX_QUERY_OUTPUT]
                 + f"\n... (truncated, {len(output)} total chars)"
             )
-        return {"success": True, "output": output or f"File: {file}\n  (empty)"}
+        result = {"success": True, "output": output or f"File: {file}\n  (empty)"}
+        if capture_output:
+            # Step P1: The uncut text must outlive this transient Pet call.
+            result["_all_output"] = original
+            result["_shown_output"] = shown
+        return result
 
     return await _server._run_with_pet(
         _do_toc,
         lifespan_state,
         "rocq_toc",
         timeout=timeout,
+        workspace=workspace,
     )
 
 
@@ -1788,6 +2126,7 @@ async def run_notations(
     lifespan_state: dict[str, Any],
     *,
     timeout: float | None = None,
+    capture_output: bool = False,
 ) -> dict[str, Any]:
     """Core implementation of rocq_notations (testable without FastMCP Context).
 
@@ -1831,10 +2170,14 @@ async def run_notations(
             notations = pet.list_notations_in_statement(state, full_statement)
 
             if not notations:
-                return {
+                result = {
                     "success": True,
                     "output": "No notations found in statement.",
                 }
+                if capture_output:
+                    result["_all_output"] = result["output"]
+                    result["_shown_output"] = result["output"]
+                return result
 
             lines = ["Notations found in statement:"]
             for ni in notations:
@@ -1844,12 +2187,18 @@ async def run_notations(
                 lines.append(f'  "{ni.notation}"  ->  {module}{scope_str}')
 
             output = "\n".join(lines)
+            original = output
+            shown = output[:_MAX_QUERY_OUTPUT]
             if len(output) > _MAX_QUERY_OUTPUT:
                 output = (
                     output[:_MAX_QUERY_OUTPUT]
                     + f"\n... (truncated, {len(output)} total chars)"
                 )
-            return {"success": True, "output": output}
+            result = {"success": True, "output": output}
+            if capture_output:
+                result["_all_output"] = original
+                result["_shown_output"] = shown
+            return result
         finally:
             _server._cleanup_coqc_artifacts(str(dummy_path))
 
@@ -1862,6 +2211,7 @@ async def run_notations(
         lifespan_state,
         "rocq_notations",
         on_timeout=_on_timeout,
+        workspace=workspace,
         timeout=timeout,
     )
 
@@ -2135,6 +2485,7 @@ async def capture_position_state(
         lifespan_state,
         tool,
         timeout=timeout,
+        workspace=workspace,
     )
 
 
@@ -2241,6 +2592,7 @@ async def run_start(
         lifespan_state,
         "rocq_start",
         timeout=timeout,
+        workspace=workspace,
     )
 
 
@@ -2267,6 +2619,7 @@ def _run_one_check_command(
     stale_warning: str | None,
     lifespan_state: dict[str, Any],
     goals_max_chars: int | None = None,
+    raw_feedback: list[tuple[int, str, str]] | None = None,
 ) -> tuple[Any, int, list[str] | None, dict[str, Any] | None]:
     """Run one ``run_check`` command and report its outcome.
 
@@ -2294,8 +2647,20 @@ def _run_one_check_command(
         new_state = pet.run(state, cmd, timeout=rocq_timeout)
 
         feedback_entry: list[str] | None = None
+        full: str | None = None
+        if raw_feedback is not None:
+            # Step P1: Retain each filtered message before the old per-step
+            # and aggregate display budgets can erase it.  No I/O under Pet.
+            full = _extract_feedback(
+                new_state, include_warnings=include_warnings, max_length=None,
+            )
+            if full is not None:
+                raw_feedback.append((command_index, cmd, full))
         if total_feedback_size < _MAX_TOTAL_FEEDBACK:
-            fb_text = _extract_feedback(new_state, include_warnings=include_warnings)
+            fb_text = (
+                _truncate_result(full, _MAX_FEEDBACK_LENGTH) if full is not None
+                else _extract_feedback(new_state, include_warnings=include_warnings)
+            )
             if fb_text is not None:
                 feedback_entry = [cmd, fb_text]
 
@@ -2483,6 +2848,7 @@ async def run_check(
     timeout: float | None = None,
     include_warnings: bool = True,
     goals_max_chars: int | None = None,
+    capture_feedback: bool = False,
 ) -> dict[str, Any]:
     """Execute commands sequentially from a state.
 
@@ -2527,6 +2893,7 @@ async def run_check(
 
     # Track progress so partial work survives an asyncio-level timeout.
     partial_state: dict[str, Any] = {"commands_run": 0}
+    raw_entries: list[tuple[int, str, str]] = []
 
     def _execute(pet: Any) -> dict[str, Any]:
         try:
@@ -2591,6 +2958,7 @@ async def run_check(
                 stale_warning=stale_warning,
                 lifespan_state=lifespan_state,
                 goals_max_chars=goals_max_chars,
+                raw_feedback=raw_entries if capture_feedback else None,
             )
             if failure is not None:
                 return failure
@@ -2639,13 +3007,18 @@ async def run_check(
     else:
         hard_timeout = _timeout
 
-    return await _server._run_with_pet(
+    result = await _server._run_with_pet(
         _execute,
         lifespan_state,
         "rocq_check",
         timeout=float(hard_timeout),
         partial_state=partial_state,
+        workspace=entry.workspace, from_state=from_state,
     )
+    if capture_feedback and isinstance(result, dict):
+        result["_raw_feedback"] = list(raw_entries)
+        result["_feedback_workspace"] = entry.workspace
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2661,6 +3034,7 @@ async def run_step_multi(
     include_warnings: bool = True,
     timeout: float | None = None,
     goals_max_chars: int | None = None,
+    capture_feedback: bool = False,
 ) -> dict[str, Any]:
     """Core implementation of rocq_step_multi (testable without FastMCP Context).
 
@@ -2699,7 +3073,7 @@ async def run_step_multi(
 
     # Quick pre-check to avoid acquiring lock for invalid states.
     # Re-validated inside _execute (state may be invalidated between checks).
-    _, _, err = _resolve_check_base_state(from_state)
+    original_entry, _, err = _resolve_check_base_state(from_state)
     if err:
         resp = _invalidated_response(from_state, lifespan_state, "rocq_step_multi")
         if resp is not None:
@@ -2708,6 +3082,8 @@ async def run_step_multi(
 
     # Shared list so partial results survive a timeout via partial_state
     partial_state: dict[str, Any] = {"partial_results": []}
+    raw_entries: list[tuple[int, str, str]] = []
+    raw_candidate_goals: list[tuple[int, str, str]] = []
 
     def _execute(pet: Any) -> dict[str, Any]:
         try:
@@ -2755,7 +3131,7 @@ async def run_step_multi(
 
         total_feedback_size = 0
 
-        for tactic in tactics:
+        for tactic_index, tactic in enumerate(tactics):
             tac = tactic.strip()
             # Focus/bullet tokens ({, }, -, +, * runs) must stay bare:
             # Rocq rejects a trailing dot (e.g. "-." is a syntax error).
@@ -2774,9 +3150,17 @@ async def run_step_multi(
                 new_state = pet.run(parent_state, tac, timeout=tac_rocq_timeout)
 
                 # Collect per-tactic feedback if any.
+                if capture_feedback:
+                    full = _extract_feedback(
+                        new_state, include_warnings=include_warnings, max_length=None,
+                    )
+                    if full is not None:
+                        raw_entries.append((tactic_index, tac, full))
                 if total_feedback_size < _MAX_TOTAL_FEEDBACK:
-                    fb_text = _extract_feedback(
-                        new_state, include_warnings=include_warnings
+                    fb_text = (
+                        _truncate_result(full, _MAX_FEEDBACK_LENGTH)
+                        if capture_feedback and full is not None
+                        else _extract_feedback(new_state, include_warnings=include_warnings)
                     )
                     if fb_text is not None:
                         entry_dict["feedback"] = fb_text
@@ -2800,6 +3184,12 @@ async def run_step_multi(
                 goals_text = _format_complete_goals(
                     complete, max_chars=goals_max_chars
                 )
+                if capture_feedback and complete is not None:
+                    full_goals = (
+                        _format_complete_goals(complete, max_chars=-1)
+                        if "[clipped " in goals_text else goals_text
+                    )
+                    raw_candidate_goals.append((tactic_index, tac, full_goals))
                 entry_dict["success"] = True
                 entry_dict["goals"] = goals_text or "No goals remaining."
                 entry_dict["proof_finished"] = new_state.proof_finished
@@ -2824,10 +3214,17 @@ async def run_step_multi(
             resp["stale_warning"] = stale_warning
         return resp
 
-    return await _server._run_with_pet(
+    result = await _server._run_with_pet(
         _execute,
         lifespan_state,
         "rocq_step_multi",
         timeout=hard_timeout,
         partial_state=partial_state,
+        workspace=original_entry.workspace, from_state=from_state,
     )
+    if capture_feedback and isinstance(result, dict):
+        result["_raw_feedback"] = list(raw_entries)
+        result["_raw_candidate_goals"] = list(raw_candidate_goals)
+        if original_entry is not None:
+            result["_feedback_workspace"] = original_entry.workspace
+    return result

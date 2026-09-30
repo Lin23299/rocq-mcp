@@ -14,9 +14,11 @@ import collections
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 import warnings
@@ -27,6 +29,23 @@ import psutil
 from fastmcp import FastMCP, Context
 from fastmcp.server.lifespan import lifespan
 from mcp.types import TextContent
+
+from rocq_mcp.output_store import (
+    FIND_TIMEOUT_SECONDS,
+    MAX_FIND_HITS,
+    MAX_READ_BYTES,
+    MAX_SNAPSHOT_BYTES,
+    OutputStore,
+    OutputStoreError,
+    reject_unregistered_handle,
+    _default_root,
+    _disjoint_workspace,
+)
+from rocq_mcp.output_contract import (
+    FIELD_VIEW_KINDS, VIEW_STATUSES, WARNING_FILTER_INCLUDE,
+    WARNING_FILTER_EXCLUDE, WARNING_FILTER_NOT_APPLICABLE,
+)
+from rocq_mcp.workspace_updates import WorkspaceUpdateError, read_signal
 
 try:  # fastmcp >= 4 exposes ToolResult; older versions keep the plain dict.
     from fastmcp.tools.base import ToolResult
@@ -169,6 +188,8 @@ _DUNE_BUILD_ENABLED: bool = os.environ.get("ROCQ_DUNE_BUILD", "1") != "0"
 # Lifespan
 # ---------------------------------------------------------------------------
 
+_output_stdio_mode = False
+
 
 @lifespan
 async def app_lifespan(server: Any) -> Any:
@@ -188,18 +209,34 @@ async def app_lifespan(server: Any) -> Any:
         "peak_pet_rss_mb": 0.0,
         "pet_generation": 0,
         "recent_errors": collections.deque(maxlen=_RECENT_ERRORS_MAX),
+        "output_store": None,
+        # FastMCP 4.0.3 gives stdio a fresh ctx.session_id on EACH request.
+        # A process explicitly launched in single-client stdio mode is the
+        # only principal we can safely bind across tool calls in this release.
+        "output_stdio": _output_stdio_mode,
+        "output_principal": "stdio:" + secrets.token_hex(16),
     }
     try:
         yield state
     finally:
-        client = state.get("pet_client")
-        if client:
-            _kill_pet(client)
-        # Clean up cache file
-        ws = state.get("workspace")
-        if ws:
-            cache_file = Path(ws) / f"rocq_mcp_cache_{os.getpid()}_.v"
-            _cleanup_coqc_artifacts(str(cache_file))
+        primary_error = sys.exc_info()[1]
+        store = state.get("output_store")
+        try:
+            if store is not None:
+                store.close()
+        except OutputStoreError:
+            if primary_error is None:
+                raise
+            primary_error.add_note("Output cleanup failed during shutdown; residual storage remains tracked.")
+        finally:
+            # Output cleanup failure must not skip independent Pet teardown.
+            client = state.get("pet_client")
+            if client:
+                _kill_pet(client)
+            ws = state.get("workspace")
+            if ws:
+                cache_file = Path(ws) / f"rocq_mcp_cache_{os.getpid()}_.v"
+                _cleanup_coqc_artifacts(str(cache_file))
 
 
 mcp = FastMCP("rocq-mcp", lifespan=app_lifespan)
@@ -1153,7 +1190,7 @@ def _invalidate_pet(lifespan_state: dict[str, Any]) -> None:
 
 
 def _set_workspace_if_needed(
-    pet: Any, workspace: str, lifespan_state: dict[str, Any]
+    pet: Any, workspace: str, lifespan_state: dict[str, Any], *, force: bool = False
 ) -> None:
     """Set pet workspace, skipping if already set to the same directory.
 
@@ -1165,10 +1202,68 @@ def _set_workspace_if_needed(
     paths and breaking cross-theory imports (an upstream pytanque limitation).
     """
     ws = str(Path(workspace).resolve())
-    if lifespan_state.get("current_workspace") != ws:
+    if force or lifespan_state.get("current_workspace") != ws:
         _parse_project_flags(Path(ws))
         pet.set_workspace(debug=False, dir=ws)
         lifespan_state["current_workspace"] = ws
+
+
+def _native_workspace_update(pet: Any, lifespan_state: dict[str, Any]) -> None:
+    """Called under the existing Pet lock; require an acknowledged native update."""
+    from rocq_mcp.interactive import _invalidate_workspace_states
+
+    # Retire Python references before sending. A timed-out old RPC thread must
+    # not later clear states created by a recovered Pet generation in finally.
+    _invalidate_workspace_states()
+    try:
+        pet.id += 1
+        pet._send_lsp_message(json.dumps({"jsonrpc": "2.0", "id": pet.id,
+                                        "method": "coq/workspace_update", "params": {}}))
+        reply = json.loads(pet._read_lsp_response())
+        if reply.get("id") != pet.id or "error" in reply or "result" not in reply or reply["result"] is not None:
+            raise WorkspaceUpdateError("Pet workspace_update failed or is unsupported; use a matching native-update backend.")
+    except (OSError, ValueError) as exc:
+        raise WorkspaceUpdateError("Pet workspace_update protocol failed.") from exc
+    lifespan_state["workspace_refreshes"] = lifespan_state.get("workspace_refreshes", 0) + 1
+
+
+def _prepare_workspace_update(pet: Any, state: dict[str, Any], workspace: str,
+                              signal: dict, *, force: bool = False) -> bool:
+    ws = str(Path(workspace).resolve())
+    previous = state.get("workspace_signal")
+    switch = state.get("current_workspace") not in (None, ws)
+    changed = previous is not None and previous != (ws, signal["token"])
+    needed = force or switch or changed or state.get("workspace_refresh_failed", False)
+    _set_workspace_if_needed(pet, ws, state, force=needed)
+    if needed:
+        state["workspace_refresh_failed"] = True
+        _native_workspace_update(pet, state)
+        state["workspace_refresh_failed"] = False
+    state["workspace_signal"] = (ws, signal["token"])
+    return bool(needed)
+
+
+def _updated_during_call(state: dict[str, Any], tool: str, result: Any, message: str,
+                         reason: str = "state_invalidated") -> dict[str, Any]:
+    """Reject continuation without erasing the already executed Coq facts."""
+    response = _fail(state, tool, message, reason=reason, execution_completed=True,
+                     invalidated=True)
+    if isinstance(result, dict):
+        response["execution_success"] = result.get("success")
+        for key in ("proof_finished", "failed_command", "command_index", "commands_run", "partial"):
+            if key in result:
+                response[key] = result[key]
+        if "reason" in result:
+            response["execution_reason"] = result["reason"]
+        if "error" in result:
+            response["execution_error"] = result["error"]
+        for collection in ("results", "partial_results"):
+            if isinstance(result.get(collection), list):
+                response["execution_" + collection] = [
+                    {key: row[key] for key in ("success", "proof_finished", "reason", "error", "tactic")
+                     if key in row} for row in result[collection] if isinstance(row, dict)
+                ]
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1234,6 +1329,7 @@ _RECENT_ERROR_REASONS: frozenset[str] = _PET_SIDE_FAILURE_REASONS | frozenset(
         # dropped because the backing file was edited (response carries
         # resume_from / resume_at).
         "state_invalidated",
+        "workspace_updating",
         # rocq_verify-specific reasons (see compile.run_verify).
         "compile_error",
         "axiom_dependency",
@@ -1419,7 +1515,7 @@ def _resolve_tool_envelope(
 # them and collapse the whole response into one unreadable single line that
 # every host truncates).  The envelope keeps ``<field>_chars`` and the full
 # dict stays available as ``structured_content``.
-_TEXT_BLOCK_FIELDS: tuple[str, ...] = ("goals", "goals_at_failure", "output")
+_TEXT_BLOCK_FIELDS: tuple[str, ...] = ("goals", "goals_at_failure", "output", "text")
 
 
 def _split_text_blocks(text: str) -> list[Any] | None:
@@ -1456,6 +1552,23 @@ def _split_text_blocks(text: str) -> list[Any] | None:
     return blocks
 
 
+def _final_content_blocks(content: list[Any] | None) -> list[Any]:
+    """Predict the existing final single-JSON-block transform before budgeting."""
+    if content and len(content) == 1 and getattr(content[0], "type", None) == "text":
+        return _split_text_blocks(content[0].text) or content
+    return content or []
+
+
+def _content_wire_bytes(content: list[Any]) -> int:
+    """Count full content values, including block metadata and JSON escaping."""
+    # ASCII JSON escaping must not disguise an unencodable source string.
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            _text_byte_length(block.text)
+    values = [block.model_dump(mode="json", by_alias=True, exclude_none=True) for block in content]
+    return len(json.dumps(values, ensure_ascii=True, separators=(",", ":")).encode("utf-8"))
+
+
 if ToolResult is not None:
     from fastmcp.server.middleware import Middleware
 
@@ -1471,6 +1584,107 @@ if ToolResult is not None:
             result = await call_next(context)
             try:
                 content = getattr(result, "content", None)
+                structured = getattr(result, "structured_content", None)
+                # The normal FastMCP result is one JSON copy of the dict.
+                # Build and measure its final blocks once, then send those
+                # same blocks. Independent content still takes the full guard.
+                if (isinstance(structured, dict) and "success" in structured
+                        and content and len(content) == 1 and content[0].type == "text"):
+                    try:
+                        derived = json.loads(content[0].text) == structured
+                    except (TypeError, ValueError):
+                        derived = False
+                    if derived:
+                        normalized = _normalize_output_receipt(structured)
+                        fits, blocks = _output_wire_view(normalized)
+                        if fits:
+                            result.structured_content = normalized
+                            result.content = blocks
+                            return result
+                content_bytes = _content_wire_bytes(_final_content_blocks(content))
+                if isinstance(structured, dict) and "success" in structured:
+                    normalized = _normalize_output_receipt(structured)
+                    if normalized != structured:
+                        # The old single JSON block is just an encoding of
+                        # structured_content.  Separate blocks, even short
+                        # ones, are NOT proven duplicates and must not be
+                        # silently replaced by that normalized JSON.
+                        try:
+                            derived = (len(content) == 1 and content[0].type == "text"
+                                       and json.loads(content[0].text) == structured)
+                        except (TypeError, ValueError, AttributeError):
+                            derived = False
+                        if not derived:
+                            normalized["view_status"] = "partial_unrecoverable"
+                            normalized["view_error_code"] = "view_unavailable"
+                            normalized["views"]["content"] = {
+                                "location": "content", "kind": "unavailable", "complete": False,
+                                "total_bytes": content_bytes, "shown_bytes": 0,
+                                "reason": "view_unavailable",
+                            }
+                        result.structured_content = normalized
+                        result.content = [TextContent(
+                            type="text", text=json.dumps(normalized, ensure_ascii=False,
+                                                         separators=(",", ":")),
+                        )]
+                        content = result.content
+                        structured = normalized
+                        content_bytes = _content_wire_bytes(_final_content_blocks(content))
+                if (isinstance(structured, dict) and content
+                        and (len(content) != 1 or content[0].type != "text")):
+                    projected = dict(structured)
+                    projected["views"] = dict(projected.get("views", {}))
+                    projected["view_status"] = "partial_unrecoverable"
+                    projected["view_error_code"] = "view_unavailable"
+                    projected["views"]["content"] = {
+                        "location": "content", "kind": "unavailable", "complete": False,
+                        "total_bytes": content_bytes, "shown_bytes": 0,
+                        "reason": "view_unavailable",
+                    }
+                    result.structured_content = projected
+                    result.content = [TextContent(
+                        type="text", text=json.dumps(projected, ensure_ascii=False,
+                                                     separators=(",", ":")),
+                    )]
+                    structured, content = projected, result.content
+                    content_bytes = _content_wire_bytes(_final_content_blocks(content))
+                structured_fits = isinstance(structured, dict) and _output_view_fits(structured)
+                if isinstance(structured, dict) and (
+                    not structured_fits or content_bytes > _OUTPUT_VIEW_CHANNEL_BYTES
+                ):
+                    projected = _project_oversized_result(structured)
+                    if structured_fits and content_bytes > _OUTPUT_VIEW_CHANNEL_BYTES:
+                        projected["view_status"] = "partial_unrecoverable"
+                        projected["view_error_code"] = "view_unavailable"
+                        projected["views"]["content"] = {
+                            "location": "content", "kind": "unavailable", "complete": False,
+                            "total_bytes": content_bytes, "shown_bytes": 0,
+                            "reason": "view_unavailable",
+                        }
+                        if not _output_view_fits(projected):
+                            projected = _project_oversized_result(projected)
+                    result.structured_content = projected
+                    result.content = [TextContent(
+                        type="text", text=json.dumps(projected, ensure_ascii=False, separators=(",", ":")),
+                    )]
+                    content = result.content
+                elif not isinstance(structured, dict) and content_bytes > _OUTPUT_VIEW_CHANNEL_BYTES:
+                    # A non-dict result has no reliable execution facts to
+                    # claim; never send its unknown raw text as a fallback.
+                    projected = {
+                        "schema_version": 1, "view_status": "partial_unrecoverable",
+                        "view_error_code": "view_unavailable",
+                        "views": {"content": {
+                            "location": "content", "kind": "unavailable", "complete": False,
+                            "total_bytes": content_bytes, "shown_bytes": 0,
+                            "reason": "view_unavailable",
+                        }},
+                    }
+                    result.structured_content = projected
+                    result.content = [TextContent(
+                        type="text", text=json.dumps(projected, ensure_ascii=True, separators=(",", ":")),
+                    )]
+                    content = result.content
                 if not content or len(content) != 1:
                     return result
                 block = content[0]
@@ -1480,11 +1694,1136 @@ if ToolResult is not None:
                 if blocks is None:
                     return result
                 result.content = blocks
-            except Exception:  # never break a tool call for formatting
+            except Exception:
+                # A formatting failure must not send the original oversized
+                # structured payload through the other MCP result channel.
+                original = getattr(result, "structured_content", None)
+                keep = {key: original[key] for key in (
+                    "success", "state_id", "from_state_id", "last_valid_state_id",
+                    "proof_finished", "partial", "command_index", "reason",
+                ) if isinstance(original, dict) and key in original}
+                safe = _project_oversized_result({
+                    **keep, "error": "Result display failed during projection.",
+                    "view_status": "partial_unrecoverable", "view_error_code": "view_unavailable",
+                })
+                result.structured_content = safe
+                result.content = [TextContent(
+                    type="text", text=json.dumps(safe, ensure_ascii=True, separators=(",", ":")),
+                )]
                 return result
             return result
 
     mcp.add_middleware(TextBlockOutputMiddleware())
+
+
+_output_store_init_lock = threading.Lock()
+_OUTPUT_VIEW_CHANNEL_BYTES = 16 * 1024
+_OUTPUT_VIEW_TOTAL_BYTES = 32 * 1024
+
+
+def _get_output_store(lifespan_state: dict[str, Any], workspace: str = "") -> OutputStore:
+    """Lazily create the private cache; normal Rocq tools do not need it."""
+    if not lifespan_state.get("output_stdio"):
+        raise OutputStoreError("unauthorized", "Output snapshots require single-client stdio mode.")
+    if not workspace:
+        raise OutputStoreError("validation", "Proof workspace is required before creating or reusing output storage.")
+    with _output_store_init_lock:
+        store = lifespan_state.get("output_store")
+        if store is None:
+            ws = _disjoint_workspace(_default_root(), workspace)
+            store = OutputStore(workspace=ws)
+            lifespan_state["output_store"] = store
+        else:
+            _disjoint_workspace(store._root, workspace)
+        return store
+
+
+def _output_owner(ctx: Context) -> str:
+    state = ctx.lifespan_context
+    if not state.get("output_stdio") or not state.get("output_principal"):
+        raise OutputStoreError("unauthorized", "MCP transport has no verified output owner.")
+    return state["output_principal"]
+
+
+def _output_error(state: dict[str, Any], tool: str, error: OutputStoreError) -> dict[str, Any]:
+    reason = "timeout" if error.code == "timeout" else (
+        "unavailable" if error.code in {"store_failed", "quota_exceeded", "stale", "view_unavailable"}
+        else "not_found" if error.code in {"expired", "not_found"}
+        else "validation"
+    )
+    return {
+        **_fail(state, tool, str(error), reason=reason),
+        "schema_version": 1,
+        "view_status": "partial_unrecoverable",
+        "view_error_code": error.code,
+        "views": {},
+    }
+
+
+def _output_wire_view(response: dict[str, Any]) -> tuple[bool, list[Any]]:
+    """Build the final blocks and check both channels in the same pass."""
+    # Preserve headroom even for clients that insert default JSON separators
+    # while serializing structured_content. Content includes complete blocks.
+    structured = len(json.dumps(response, ensure_ascii=True).encode("utf-8"))
+    raw = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    blocks = _split_text_blocks(raw) or [TextContent(type="text", text=raw)]
+    content = _content_wire_bytes(blocks)
+    fits = (structured <= _OUTPUT_VIEW_CHANNEL_BYTES
+            and content <= _OUTPUT_VIEW_CHANNEL_BYTES
+            and structured + content <= _OUTPUT_VIEW_TOTAL_BYTES)
+    return fits, blocks
+
+
+def _output_view_fits(response: dict[str, Any]) -> bool:
+    """Bound both MCP channels, including Unicode escaped by a JSON client."""
+    return _output_wire_view(response)[0]
+
+
+def _normalize_output_receipt(payload: dict[str, Any]) -> dict[str, Any]:
+    """Give short errors and legacy clipped fields explicit view semantics."""
+    response = dict(payload)
+    response.setdefault("schema_version", 1)
+    response.setdefault("view_status", "complete")
+    current_views = response.get("views")
+    response["views"] = dict(current_views) if isinstance(current_views, dict) else {}
+    if response["view_status"] not in VIEW_STATUSES:
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = "invalid_view_status"
+    for key, view in list(response["views"].items()):
+        if not isinstance(view, dict) or view.get("kind") not in FIELD_VIEW_KINDS:
+            response["views"][key] = {
+                "location": key, "kind": "unavailable", "complete": False,
+                "total_bytes": None, "shown_bytes": 0, "reason": "invalid_view_status",
+            }
+            response["view_status"] = "partial_unrecoverable"
+            response["view_error_code"] = "invalid_view_status"
+            continue
+        kind = view["kind"]
+        total, shown = view.get("total_bytes"), view.get("shown_bytes")
+        valid = (view.get("location") == key
+                 and (total is None or (type(total) is int and total >= 0))
+                 and type(shown) is int and shown >= 0
+                 and (total is None or shown <= total))
+        if kind == "inline":
+            valid = valid and view.get("complete") is True and type(total) is int
+        elif kind == "unavailable":
+            valid = (valid and view.get("complete") is False
+                     and isinstance(view.get("reason"), str) and bool(view["reason"]))
+        else:
+            valid = (valid and view.get("complete") is False
+                     and isinstance(view.get("owner_generation"), str)
+                     and bool(view["owner_generation"]))
+            if kind == "stored":
+                sha = view.get("sha256")
+                valid = (valid and type(total) is int
+                         and isinstance(view.get("handle"), str) and bool(view["handle"])
+                         and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha) is not None)
+        if not valid:
+            response["views"][key] = {
+                "location": key, "kind": "unavailable", "complete": False,
+                "total_bytes": None, "shown_bytes": 0, "reason": "invalid_view_status",
+            }
+            response["view_status"] = "partial_unrecoverable"
+            response["view_error_code"] = "invalid_view_status"
+            continue
+        if kind == "unavailable":
+            response["view_status"] = "partial_unrecoverable"
+            response["view_error_code"] = response.get("view_error_code", "view_unavailable")
+        elif view["kind"] in {"stored", "live_state"} and response["view_status"] == "complete":
+            response["view_status"] = "partial_recoverable"
+    locations = [(key, value) for key, value in response.items() if isinstance(value, str)]
+    for collection in ("results", "partial_results"):
+        rows = response.get(collection, [])
+        for index, item in enumerate(rows if isinstance(rows, list) else []):
+            if isinstance(item, dict):
+                locations.extend((f"{collection}[{index}].{key}", value)
+                                 for key, value in item.items() if isinstance(value, str))
+    for location, value in locations:
+        if location in response["views"]:
+            continue
+        if (re.search(r"\[clipped \d+ of \d+ chars;", value)
+                or re.search(r"\.\.\. \(truncated, \d+ total chars\)", value)):
+            response["views"][location] = {
+                "location": location, "kind": "unavailable", "complete": False,
+                "total_bytes": None, "shown_bytes": _text_byte_length(value),
+                "reason": "source_clipped",
+            }
+            response["view_status"] = "partial_unrecoverable"
+            response["view_error_code"] = "view_unavailable"
+    return response
+
+
+def _project_oversized_result(payload: dict[str, Any]) -> dict[str, Any]:
+    """Fail-closed final projection for previously unmodelled large fields.
+
+    Producer-specific views are attached before this point.  Unknown
+    diagnostic/metadata fields have no owned full-text source, so explicitly
+    mark them unavailable while keeping execution/state facts and existing
+    stored/live-state views.  This is also the final structured-content guard.
+    """
+    # Step P4: Project unknown fields only after producer-specific source
+    # capture, preserving execution facts and bounding both wire channels.
+    response = dict(payload)
+    views = dict(response.get("views", {})) if isinstance(response.get("views"), dict) else {}
+    response["views"] = views
+    response.setdefault("schema_version", 1)
+    response["view_status"] = "partial_unrecoverable"
+    response["view_error_code"] = "view_unavailable"
+    overflow_count = 0
+    overflow_seen: set[str] = set()
+    overflow_sample: list[str] = []
+
+    def record_overflow(path: str) -> None:
+        nonlocal overflow_count
+        if path in overflow_seen:
+            return
+        overflow_seen.add(path)
+        overflow_count += 1
+        if len(overflow_sample) < 8:
+            try:
+                prefix, shown = _text_prefix(path, 96)
+                overflow_sample.append(
+                    prefix + ("... [path incomplete]" if shown < _text_byte_length(path) else "")
+                )
+            except UnicodeError:
+                overflow_sample.append("[path is not valid UTF-8]")
+        views["__omitted_fields__"] = {
+            "location": "__omitted_fields__", "kind": "unavailable", "complete": False,
+            "total_bytes": None, "shown_bytes": 0,
+            "reason": "field_index_overflow", "omitted_count": overflow_count,
+            "paths_preview": list(overflow_sample),
+            "unlisted_count": overflow_count - len(overflow_sample),
+        }
+
+    def update_display(path: str, shown: int, *, descendants: bool = False) -> None:
+        # Copy instead of changing a producer's source identity in-place.
+        for key, view in list(views.items()):
+            if key != path and not (descendants and (
+                    key.startswith(path + ".") or key.startswith(path + "["))):
+                continue
+            updated = {**view, "shown_bytes": min(view.get("shown_bytes", 0), shown)}
+            if view.get("kind") == "inline":
+                updated.update(kind="unavailable", complete=False, reason="view_unavailable")
+            views[key] = updated
+
+    def mark(path: str, original: Any, shown: int = 0, reason: str = "view_unavailable") -> None:
+        # A pre-existing stored/live view identifies a complete original
+        # source.  Compressing its displayed collection must not erase H.
+        location = path
+        if path in views:
+            update_display(path, shown)
+            location = path + "_display"
+            if location in views:
+                update_display(location, shown)
+                return
+        if len(views) >= 32:
+            record_overflow(location)
+            return
+        try:
+            total = (len(original.encode("utf-8")) if isinstance(original, str)
+                     else len(json.dumps(original, ensure_ascii=True,
+                                         separators=(",", ":")).encode("utf-8")))
+        except (TypeError, UnicodeError):
+            total = None
+        views[location] = {"location": location, "kind": "unavailable",
+                           "complete": False, "total_bytes": total,
+                           "shown_bytes": shown, "reason": reason}
+
+    def bound(value: Any, path: str, depth: int = 0) -> Any:
+        if isinstance(value, str):
+            try:
+                size = len(value.encode("utf-8"))
+                if size <= 512:
+                    return value
+                prefix, shown = _text_prefix(value, 384)
+                mark(path, value, shown)
+                recoverable = views.get(path, {}).get("kind") in {"stored", "live_state"}
+                notice = ("field incomplete; see source view" if recoverable
+                          else "field incomplete; full source unavailable")
+                return prefix + f"\n... [{notice}]"
+            except UnicodeError:
+                mark(path, value, reason="invalid_text")
+                return "[field unavailable: invalid UTF-8]"
+        if isinstance(value, list):
+            if depth >= 3:
+                update_display(path, 0, descendants=True)
+                mark(path, value)
+                return []
+            end = min(len(value), 20)
+            if end < len(value):
+                # Walk the view index, not an arbitrarily long omitted tail.
+                for key in list(views):
+                    match = re.match(re.escape(path) + r"\[(\d+)\](?:[.\[]|$)", key)
+                    if match and int(match[1]) >= end:
+                        update_display(key, 0)
+                mark(path, value)
+            return [bound(item, f"{path}[{index}]", depth + 1)
+                    for index, item in enumerate(value[:end])]
+        if isinstance(value, dict):
+            if depth >= 3:
+                update_display(path, 0, descendants=True)
+                mark(path, value)
+                return {}
+            items = list(value.items())
+            if len(items) > 32:
+                for key, _ in items[32:]:
+                    update_display(f"{path}.{key}" if path else key, 0, descendants=True)
+                mark(path, value)
+            return {key: bound(item, f"{path}.{key}" if path else key, depth + 1)
+                    for key, item in items[:32]}
+        return value
+
+    for key in list(response):
+        if key == "views":
+            continue
+        response[key] = bound(response[key], key)
+    if _output_view_fits(response):
+        return response
+
+    # Keep authoritative execution fields and group handles before dropping
+    # nonessential metadata.  Atomic segment indexes still recover any
+    # per-step feedback/goal view discarded to fit the receipt.
+    protected = {
+        "success", "schema_version", "view_status", "view_error_code", "views",
+        "state_id", "from_state_id", "last_valid_state_id", "reason",
+        "proof_finished", "partial", "commands_run", "command_index",
+        "feedback_total_entries", "candidate_goals_total_entries",
+    }
+    candidates = sorted(
+        (key for key in response if key not in protected),
+        key=lambda key: len(json.dumps(response[key], ensure_ascii=True, default=str)),
+        reverse=True,
+    )
+    for key in candidates:
+        value = response[key]
+        if key in {"results", "partial_results"} and isinstance(value, list):
+            for index, item in enumerate(value):
+                if isinstance(item, dict):
+                    for name in item:
+                        if name not in {"success", "reason", "proof_finished"}:
+                            update_display(f"{key}[{index}].{name}", 0, descendants=True)
+            response[key] = [
+                {name: item[name] for name in ("success", "reason", "proof_finished") if name in item}
+                for item in value if isinstance(item, dict)
+            ]
+            mark(key, value)
+            if _output_view_fits(response):
+                return response
+            continue
+        response.pop(key)
+        update_display(key, 0, descendants=True)
+        mark(key, value)
+        if _output_view_fits(response):
+            return response
+    for key in list(views):
+        if key not in {"feedback", "candidate_goals", "diagnostics", "output",
+                       "goals", "goals_at_failure", "__omitted_fields__"}:
+            views.pop(key)
+            record_overflow(key)
+            if _output_view_fits(response):
+                return response
+    if not _output_view_fits(response):
+        # A maliciously large error/reason cannot invalidate the byte cap.
+        keep = {key: response[key] for key in (
+            "success", "state_id", "from_state_id", "last_valid_state_id",
+            "proof_finished", "partial", "commands_run", "command_index",
+            "results", "partial_results",
+        ) if key in response}
+        for collection in ("results", "partial_results"):
+            if collection in keep:
+                keep[collection] = [
+                    {key: item[key] for key in ("success", "proof_finished", "reason")
+                     if key in item and (key != "reason" or
+                                         (isinstance(item[key], str) and len(item[key]) <= 64))}
+                    for item in keep[collection][:20] if isinstance(item, dict)
+                ]
+        preserved = {key: value for key, value in views.items()
+                     if key in {"feedback", "candidate_goals", "diagnostics", "output",
+                                "goals", "goals_at_failure"}
+                      and value.get("kind") in {"stored", "live_state"}}
+        preserved = {key: {**value, "shown_bytes": 0} for key, value in preserved.items()}
+        record_overflow("metadata")
+        response = {**keep, "schema_version": 1, "view_status": "partial_unrecoverable",
+                    "view_error_code": "view_unavailable",
+                    "views": {**preserved, "__omitted_fields__": views["__omitted_fields__"]}}
+        if not _output_view_fits(response):
+            response = {"success": payload.get("success") is True,
+                        "schema_version": 1, "view_status": "partial_unrecoverable",
+                        "view_error_code": "view_unavailable", "views": {
+                            "__omitted_fields__": views["__omitted_fields__"]},
+                        "error": "All oversized execution metadata was unavailable."}
+            for key in ("state_id", "from_state_id", "last_valid_state_id", "command_index"):
+                value = payload.get(key)
+                if type(value) is int and 0 <= value < 2**64:
+                    response[key] = value
+            for key in ("proof_finished", "partial"):
+                if type(payload.get(key)) is bool:
+                    response[key] = payload[key]
+            reason = payload.get("reason")
+            if isinstance(reason, str) and len(reason) <= 128 and reason.isascii():
+                response["reason"] = reason
+    return response
+
+
+def _output_success(
+    result: dict[str, Any], *, handle: str | None = None,
+    generation: str | None = None,
+) -> dict[str, Any]:
+    response = {"schema_version": 1, "success": True,
+                "view_status": "complete", "views": {}, **result}
+    if "text" in result:
+        displayed = len(result["text"].encode("utf-8"))
+        response["views"]["text"] = {
+            "location": "text", "kind": "inline", "complete": True,
+            "total_bytes": displayed, "shown_bytes": displayed,
+        }
+    # A complete *chunk* is not a complete view of the saved source.
+    partial = (result.get("has_more", False) or result.get("start", 0) > 0
+               or result.get("cursor", 0) > 0)
+    if partial and handle is not None and generation is not None:
+        response["view_status"] = "partial_recoverable"
+        response["views"]["source"] = {
+            "location": "source", "kind": "stored", "complete": False,
+            "total_bytes": result["total_bytes"],
+            "shown_bytes": len(result.get("text", "").encode("utf-8")),
+            "sha256": result["source_sha256"], "handle": handle,
+            "owner_generation": generation,
+        }
+    return response
+
+
+def _text_byte_length(text: str) -> int:
+    """Count UTF-8 bytes without allocating a second unbounded result."""
+    return sum(len(text[i:i + 16_384].encode("utf-8")) for i in range(0, len(text), 16_384))
+
+
+def _text_prefix(text: str, limit_bytes: int) -> tuple[str, int]:
+    # Python Unicode characters take at least one UTF-8 byte.
+    raw = text[:limit_bytes].encode("utf-8")[:limit_bytes]
+    preview = raw.decode("utf-8", errors="ignore")
+    return preview, len(preview.encode("utf-8"))
+
+
+def _bound_query_metadata(response: dict[str, Any]) -> None:
+    """Do not let an advisory bypass the query's bounded output view."""
+    for key in ("stale_warning", "workspace_warning"):
+        original = response.get(key)
+        if not isinstance(original, str) or len(original) <= 1024:
+            continue
+        prefix, shown = _text_prefix(original, 256)
+        response[key] = prefix + "... [advisory text incomplete]"
+        response["views"][key] = {
+            "location": key, "kind": "unavailable", "complete": False,
+            "total_bytes": _text_byte_length(original), "shown_bytes": shown,
+            "reason": "view_unavailable",
+        }
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = "view_unavailable"
+
+
+async def _query_result_view(
+    response: dict[str, Any], *, full: str, shown: str,
+    total_messages: int = 0, shown_messages: int = 0, state: dict[str, Any],
+    ctx: Context, workspace: str, origin: str = "rocq_query",
+    warning_filter: str = WARNING_FILTER_NOT_APPLICABLE,
+) -> dict[str, Any]:
+    """Materialize omitted transient text *after* the Pet lock is released."""
+    response = {**response, "schema_version": 1, "view_status": "complete",
+                "views": {}}
+    if origin == "rocq_query":
+        response["feedback_total_messages"] = total_messages
+        response["feedback_shown_messages"] = shown_messages
+        response["warning_filter"] = warning_filter
+        response["feedback_snapshot_complete"] = False
+    try:
+        _bound_query_metadata(response)
+        total_bytes = _text_byte_length(full)
+        if not full and not shown and response.get("output"):
+            # The public output field is a genuine (no output)/(empty)
+            # placeholder.  Its inline FieldView describes that field, not
+            # the zero raw feedback messages counted separately below.
+            total_bytes = _text_byte_length(response["output"])
+    except UnicodeError:
+        # A malformed upstream string is not a valid UTF-8 snapshot and
+        # cannot be sent through either MCP channel as if it were complete.
+        return {
+            "schema_version": 1, "success": response["success"],
+            **({"from_state_id": response["from_state_id"]}
+               if "from_state_id" in response else {}),
+            **({"feedback_total_messages": total_messages,
+                "feedback_shown_messages": shown_messages,
+                "warning_filter": warning_filter,
+                "feedback_snapshot_complete": False}
+               if origin == "rocq_query" else {}),
+            "view_status": "partial_unrecoverable",
+            "view_error_code": "invalid_text",
+            "views": {"output": {
+                "location": "output", "kind": "unavailable", "complete": False,
+                "total_bytes": None, "shown_bytes": 0, "reason": "invalid_text",
+            }},
+            "output": "[Rocq output is not valid UTF-8]",
+        }
+    response["views"]["output"] = {
+        "location": "output", "kind": "inline", "complete": True,
+        "total_bytes": total_bytes, "shown_bytes": total_bytes,
+    }
+    # Step P2: A message count limit is an omission even when the preview
+    # happens to fit the byte budget.  Large default results also need a
+    # handle: both MCP channels, not just the first text block, must fit.
+    omitted = shown_messages < total_messages or shown != full
+    if not omitted and len(response["output"]) <= _OUTPUT_VIEW_CHANNEL_BYTES and _output_view_fits(response):
+        return response
+
+    preview, preview_bytes = _text_prefix(shown, 2048)
+    response["output"] = preview + "\n... [output incomplete; see views.output]"
+    if response["view_status"] == "complete":
+        response["view_status"] = "partial_recoverable"
+    try:
+        owner = _output_owner(ctx)
+        store = await asyncio.to_thread(_get_output_store, state, workspace)
+        saved = await asyncio.to_thread(
+            store.save, full, owner_session=owner, workspace=workspace,
+            origin=origin, warning_filter=warning_filter,
+            covers_filtered_all=True if origin == "rocq_query" else None,
+        )
+        if origin == "rocq_query":
+            response["feedback_snapshot_complete"] = saved["covers_filtered_all"]
+        response["views"]["output"] = {
+            "location": "output", "kind": "stored", "complete": False,
+            "total_bytes": saved["total_bytes"], "shown_bytes": preview_bytes,
+            "sha256": saved["source_sha256"], "handle": saved["handle"],
+            "owner_generation": saved["owner_generation"],
+        }
+    except OutputStoreError as exc:
+        # A successful Coq query stays successful; inability to display its
+        # complete text is a separate, explicit failure.
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = exc.code
+        response["views"]["output"] = {
+            "location": "output", "kind": "unavailable", "complete": False,
+            "total_bytes": total_bytes, "shown_bytes": preview_bytes,
+            "reason": exc.code,
+        }
+    if not _output_view_fits(response):
+        # Fail closed on an unforeseen extra field without discarding an
+        # already saved and valid handle for the printed output.
+        retained = {"success", "schema_version", "from_state_id", "stale_warning",
+                    "output", "views", "view_status", "view_error_code",
+                    "feedback_total_messages", "feedback_shown_messages",
+                    "warning_filter", "feedback_snapshot_complete"}
+        keep = {key: response[key] for key in
+                ("success", "schema_version", "from_state_id", "stale_warning")
+                if key in response}
+        keep["output"] = "[some query metadata was too large to display]"
+        keep["views"] = {key: dict(view) for key, view in response["views"].items()}
+        if "output" in keep["views"]:
+            # The replacement is a notice, not source bytes from the
+            # registered output.  The original printed text remains at H.
+            keep["views"]["output"]["shown_bytes"] = 0
+        for key, value in response.items():
+            if key in retained or key in keep["views"]:
+                continue
+            try:
+                size = (_text_byte_length(value) if isinstance(value, str)
+                        else len(json.dumps(value, ensure_ascii=True,
+                                            separators=(",", ":")).encode("utf-8")))
+            except (TypeError, UnicodeError):
+                size = None
+            keep["views"][key] = {
+                "location": key, "kind": "unavailable", "complete": False,
+                "total_bytes": size, "shown_bytes": 0,
+                "reason": "view_unavailable",
+            }
+        if origin == "rocq_query":
+            keep["feedback_total_messages"] = total_messages
+            keep["feedback_shown_messages"] = shown_messages
+            keep["warning_filter"] = warning_filter
+            keep["feedback_snapshot_complete"] = response["feedback_snapshot_complete"]
+        response = keep
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = "view_unavailable"
+        if not _output_view_fits(response):
+            response = _project_oversized_result(response)
+    return response
+
+
+def _feedback_transcript(
+    entries: list[tuple[int, str, str]], *, kind: str = "feedback",
+) -> tuple[str, list[tuple[int, int]]]:
+    """A single bounded snapshot with typed command-index headers."""
+    pieces: list[str] = []
+    spans: list[tuple[int, int]] = []
+    length = 0
+    for index, command, text in entries:
+        raw_bytes = _text_byte_length(text)
+        location = f";location:{command}" if kind == "diagnostics" else ""
+        header = f"\n[rocq-{kind}-index:{index}{location};bytes:{raw_bytes}]\n"
+        length += len(header.encode("utf-8"))
+        start = length
+        length += raw_bytes
+        if length > MAX_SNAPSHOT_BYTES:
+            raise OutputStoreError("quota_exceeded", "Batch feedback exceeds one output snapshot.")
+        spans.append((start, length))
+        pieces.extend((header, text))
+    return "".join(pieces), spans
+
+
+def _batch_auxiliary_view(response: dict[str, Any]) -> None:
+    """Make unhandled large goal/diagnostic fields explicitly incomplete."""
+    def bound(field: dict[str, Any], key: str, location: str) -> None:
+        text = field.get(key)
+        if not isinstance(text, str):
+            return
+        clipped = "[clipped " in text or "... (truncated," in text
+        size = _text_byte_length(text)
+        if not clipped and size <= _OUTPUT_VIEW_CHANNEL_BYTES:
+            return
+        if size <= _OUTPUT_VIEW_CHANNEL_BYTES:
+            shown = size  # Keep the useful structurally clipped goal as-is.
+        else:
+            prefix, shown = _text_prefix(text, 512)
+            field[key] = prefix + "\n... [view incomplete; semantic retrieval pending]"
+        response["views"][location] = {
+            "location": location, "kind": "unavailable", "complete": False,
+            "total_bytes": None if clipped else size,
+            "shown_bytes": shown, "reason": "goal_source_clipped" if clipped else "view_unavailable",
+        }
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = "view_unavailable"
+
+    for name in ("goals", "goals_at_failure", "error", "failed_command", "stale_warning"):
+        bound(response, name, name)
+    for collection in ("results", "partial_results"):
+        for index, item in enumerate(response.get(collection, [])):
+            for name in ("goals", "error", "tactic"):
+                bound(item, name, f"{collection}[{index}].{name}")
+    tactics = response.get("proof_tactics")
+    encoded_tactics = (json.dumps(tactics, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+                       if isinstance(tactics, list) else b"")
+    if len(encoded_tactics) > _OUTPUT_VIEW_CHANNEL_BYTES:
+        response["proof_tactics_count"] = len(tactics)
+        response["proof_tactics"] = []
+        response["views"]["proof_tactics"] = {
+            "location": "proof_tactics", "kind": "unavailable", "complete": False,
+            "total_bytes": len(encoded_tactics), "shown_bytes": 0,
+            "reason": "view_unavailable",
+        }
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = "view_unavailable"
+
+
+async def _batch_feedback_view(
+    result: dict[str, Any], *, entries: list[tuple[int, str, str]],
+    kind: str, ctx: Context, workspace: str, warning_filter: str,
+) -> dict[str, Any]:
+    """Preserve per-command feedback without moving disk I/O under Pet."""
+    response = {**result, "schema_version": 1, "view_status": "complete", "views": {},
+                "warning_filter": warning_filter}
+    list_key = "results" if "results" in result else "partial_results"
+    if kind == "rocq_step_multi":
+        response[list_key] = [dict(item) for item in result.get(list_key, [])]
+    else:
+        response["feedback"] = [list(item) for item in result.get("feedback", [])]
+    _batch_auxiliary_view(response)
+    shown = (response.get("feedback", []) if kind == "rocq_check" else
+             [item.get("feedback") for item in response.get(list_key, [])])
+    if kind == "rocq_check":
+        visible_complete = len(shown) == len(entries) and all(
+            pair == [command, text] for pair, (_index, command, text) in zip(shown, entries)
+        )
+    else:
+        visible_complete = all(
+            index < len(shown) and shown[index] == text for index, _command, text in entries
+        )
+    if visible_complete and _output_view_fits(response):
+        return response
+
+    response["feedback_total_entries"] = len(entries)
+    saved: dict[str, Any] | None = None
+    spans: list[tuple[int, int]] = []
+    try:
+        if entries:
+            transcript, spans = _feedback_transcript(entries)
+            owner = _output_owner(ctx)
+            store = await asyncio.to_thread(_get_output_store, ctx.lifespan_context, workspace)
+            saved = await asyncio.to_thread(
+                store.save, transcript, owner_session=owner, workspace=workspace, origin=kind,
+                warning_filter=warning_filter, covers_filtered_all=True,
+                segments=[(item[0], start, stop) for item, (start, stop) in zip(entries, spans)],
+            )
+            response["views"]["feedback"] = {
+                "location": "feedback", "kind": "stored", "complete": False,
+                "total_bytes": saved["total_bytes"], "shown_bytes": 0,
+                "sha256": saved["source_sha256"], "handle": saved["handle"],
+                "owner_generation": saved["owner_generation"],
+            }
+            if response["view_status"] == "complete":
+                response["view_status"] = "partial_recoverable"
+    except OutputStoreError as exc:
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = exc.code
+        response["views"]["feedback"] = {
+            "location": "feedback", "kind": "unavailable", "complete": False,
+            "total_bytes": None, "shown_bytes": 0, "reason": exc.code,
+        }
+
+    if kind == "rocq_check":
+        response["feedback"] = []
+    limit = min(len(entries), 20)
+    for pos, (index, command, text) in enumerate(entries[:limit]):
+        prefix, size = _text_prefix(text, 96)
+        preview = prefix + ("\n... [feedback incomplete]" if size < _text_byte_length(text) else "")
+        location = f"feedback[{index}].text" if kind == "rocq_check" else f"{list_key}[{index}].feedback"
+        if kind == "rocq_check":
+            command_preview = command[:128]
+            if len(command) > 128:
+                command_preview += " ... [command incomplete]"
+                response["views"][f"feedback[{index}].command"] = {
+                    "location": f"feedback[{index}].command", "kind": "unavailable",
+                    "complete": False, "total_bytes": _text_byte_length(command),
+                    "shown_bytes": _text_byte_length(command[:128]),
+                    "reason": "view_unavailable",
+                }
+                response["view_status"] = "partial_unrecoverable"
+                response["view_error_code"] = "view_unavailable"
+            response["feedback"].append([command_preview, preview])
+        elif index < len(response[list_key]):
+            response[list_key][index]["feedback"] = preview
+        view = {"location": location, "kind": "stored" if saved else "unavailable",
+                "complete": False, "total_bytes": _text_byte_length(text),
+                "shown_bytes": size}
+        if saved:
+            view.update({"handle": saved["handle"], "sha256": saved["source_sha256"],
+                         "owner_generation": saved["owner_generation"],
+                         "span_start": spans[pos][0], "span_end": spans[pos][1]})
+        else:
+            view["reason"] = response["view_error_code"]
+        response["views"][location] = view
+    if kind == "rocq_step_multi":
+        kept = {item[0] for item in entries[:limit]}
+        for index, entry in enumerate(response.get(list_key, [])):
+            if index not in kept:
+                entry.pop("feedback", None)
+    response["feedback_preview_entries"] = limit
+    # Remaining indices come from rocq_list_output_segments; matching a
+    # textual header is only navigation, never authoritative provenance.
+    while not _output_view_fits(response) and limit > 0:
+        limit -= 1
+        old_index = entries[limit][0]
+        location = f"feedback[{old_index}].text" if kind == "rocq_check" else f"{list_key}[{old_index}].feedback"
+        response["views"].pop(location, None)
+        response["views"].pop(f"feedback[{old_index}].command", None)
+        if kind == "rocq_check":
+            response["feedback"].pop()
+        elif old_index < len(response.get(list_key, [])):
+            response[list_key][old_index].pop("feedback", None)
+        response["feedback_preview_entries"] = limit
+    if not _output_view_fits(response):
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = "view_unavailable"
+        if kind == "rocq_step_multi":
+            original_list_bytes = _text_byte_length(
+                json.dumps(result.get(list_key, []), ensure_ascii=True, separators=(",", ":")),
+            )
+            response[list_key] = [
+                {key: item[key] for key in (
+                    "success", "reason", "proof_finished", "focus_depth",
+                    "shelved_goals", "given_up_goals",
+                ) if key in item}
+                for item in response.get(list_key, [])
+            ]
+            response["views"][list_key] = {
+                "location": list_key, "kind": "unavailable", "complete": False,
+                "total_bytes": original_list_bytes, "shown_bytes": 0, "reason": "view_unavailable",
+            }
+        else:
+            original_list_bytes = _text_byte_length(
+                json.dumps(result.get("feedback", []), ensure_ascii=True, separators=(",", ":")),
+            )
+            response["feedback"] = []
+            location = ("feedback_display" if response["views"].get("feedback", {}).get("kind") == "stored"
+                        else "feedback")
+            response["views"][location] = {
+                "location": location, "kind": "unavailable", "complete": False,
+                "total_bytes": original_list_bytes, "shown_bytes": 0,
+                "reason": "view_unavailable",
+            }
+    return response
+
+
+async def _candidate_goal_view(
+    response: dict[str, Any], *, entries: list[tuple[int, str, str]],
+    ctx: Context, workspace: str,
+) -> dict[str, Any]:
+    """Save unregistered step_multi candidate goals before their text is lost."""
+    list_key = "results" if "results" in response else "partial_results"
+    rows = response.get(list_key, [])
+    needed = [index for index, _tactic, _text in entries if (
+        index >= len(rows)
+        or not isinstance(rows[index].get("goals"), str)
+        or "[clipped " in rows[index]["goals"]
+        or response.get("views", {}).get(f"{list_key}[{index}].goals", {}).get("kind") == "unavailable"
+    )]
+    if not needed:
+        return response
+    response.setdefault("views", {})
+    response["candidate_goals_total_entries"] = len(entries)
+    try:
+        transcript, spans = _feedback_transcript(entries, kind="goals")
+        owner = _output_owner(ctx)
+        store = await asyncio.to_thread(_get_output_store, ctx.lifespan_context, workspace)
+        saved = await asyncio.to_thread(
+            store.save, transcript, owner_session=owner, workspace=workspace,
+            origin="rocq_step_multi_goals",
+            segments=[(index, start, end) for (index, _tactic, _text), (start, end)
+                      in zip(entries, spans)],
+        )
+        response["views"]["candidate_goals"] = {
+            "location": "candidate_goals", "kind": "stored", "complete": False,
+            "total_bytes": saved["total_bytes"], "shown_bytes": 0,
+            "sha256": saved["source_sha256"], "handle": saved["handle"],
+            "owner_generation": saved["owner_generation"],
+        }
+        for (index, _tactic, text), (start, end) in zip(entries, spans):
+            if index not in needed:
+                continue
+            location = f"{list_key}[{index}].goals"
+            if index < len(rows):
+                prefix, shown = _text_prefix(text, 96)
+                rows[index]["goals"] = prefix + "\n... [goal incomplete; read candidate_goals snapshot]"
+            else:
+                shown = 0
+            response["views"][location] = {
+                "location": location, "kind": "stored", "complete": False,
+                "total_bytes": _text_byte_length(text), "shown_bytes": shown,
+                "sha256": saved["source_sha256"], "handle": saved["handle"],
+                "owner_generation": saved["owner_generation"],
+                "span_start": start, "span_end": end,
+            }
+        if not any(view.get("kind") == "unavailable" for view in response["views"].values()):
+            response["view_status"] = "partial_recoverable"
+            response.pop("view_error_code", None)
+    except (OutputStoreError, UnicodeError) as exc:
+        code = exc.code if isinstance(exc, OutputStoreError) else "invalid_text"
+        for index in needed:
+            location = f"{list_key}[{index}].goals"
+            response["views"][location] = {
+                "location": location, "kind": "unavailable", "complete": False,
+                "total_bytes": None, "shown_bytes": 0, "reason": code,
+            }
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = code
+    while not _output_view_fits(response):
+        previews = [index for index in reversed(needed)
+                    if index < len(rows) and isinstance(rows[index].get("goals"), str)
+                    and rows[index]["goals"] != "[goal in stored snapshot]" ]
+        if previews:
+            rows[previews[0]]["goals"] = "[goal in stored snapshot]"
+            response["views"][f"{list_key}[{previews[0]}].goals"]["shown_bytes"] = 0
+            continue
+        # Per-candidate fields remain available through the atomic index tool.
+        for index in reversed(needed):
+            response["views"].pop(f"{list_key}[{index}].goals", None)
+            if _output_view_fits(response):
+                break
+        break
+    return response
+
+
+async def _diagnostic_views(
+    response: dict[str, Any], *, original: dict[str, Any],
+    ctx: Context, workspace: str, origin: str,
+) -> dict[str, Any]:
+    """Save known diagnostics that the actual final projection would omit."""
+    response = dict(response)
+    response.setdefault("schema_version", 1)
+    response.setdefault("view_status", "complete")
+    response["views"] = dict(response.get("views", {}))
+    for collection in ("results", "partial_results"):
+        if isinstance(response.get(collection), list):
+            response[collection] = [dict(row) if isinstance(row, dict) else row
+                                    for row in response[collection]]
+    sources: dict[str, str] = {}
+    chosen: set[str] = set()
+
+    def displayed(payload: dict[str, Any], location: str) -> Any:
+        if location in {"error", "failed_command"}:
+            return payload.get(location)
+        collection, suffix = location.split("[", 1)
+        index = int(suffix.split("]", 1)[0])
+        rows = payload.get(collection, [])
+        return rows[index].get("error") if index < len(rows) and isinstance(rows[index], dict) else None
+
+    def replace(payload: dict[str, Any], location: str, text: str) -> None:
+        if location in {"error", "failed_command"}:
+            payload[location] = text
+        else:
+            collection, suffix = location.split("[", 1)
+            index = int(suffix.split("]", 1)[0])
+            rows = payload.get(collection, [])
+            if index < len(rows) and isinstance(rows[index], dict):
+                rows[index]["error"] = text
+
+    def select(location: str, text: Any) -> None:
+        if not isinstance(text, str):
+            return
+        try:
+            _text_byte_length(text)
+        except UnicodeError:
+            response["views"][location] = {
+                "location": location, "kind": "unavailable", "complete": False,
+                "total_bytes": None, "shown_bytes": 0, "reason": "invalid_text",
+            }
+            response["view_status"] = "partial_unrecoverable"
+            response["view_error_code"] = "invalid_text"
+            replace(response, location, "[diagnostic is not valid UTF-8]")
+            return
+        sources[location] = text
+        if (displayed(response, location) != text
+                or response["views"].get(location, {}).get("kind") == "unavailable"):
+            chosen.add(location)
+
+    for key in ("error", "failed_command"):
+        select(key, original.get(key))
+    for collection in ("results", "partial_results"):
+        for index, item in enumerate(original.get(collection, [])):
+            if isinstance(item, dict):
+                select(f"{collection}[{index}].error", item.get("error"))
+
+    # Normal successful proof steps have no diagnostic source. They do not
+    # need the diagnostic planner or another full response serialization.
+    if not sources:
+        return response
+    if not chosen:
+        try:
+            if _output_view_fits(response):
+                return response
+        except (UnicodeError, TypeError):
+            pass
+
+    def represented(entries: list[tuple[int, str, str]], saved: dict[str, Any] | None,
+                    spans: list[tuple[int, int]], code: str | None) -> dict[str, Any]:
+        # The planner and the actual receipt share one layout, not thresholds.
+        result = {**response, "views": dict(response["views"])}
+        for collection in ("results", "partial_results"):
+            if isinstance(result.get(collection), list):
+                result[collection] = [dict(row) if isinstance(row, dict) else row
+                                      for row in result[collection]]
+        if saved:
+            result["views"]["diagnostics"] = {
+                "location": "diagnostics", "kind": "stored", "complete": False,
+                "total_bytes": saved["total_bytes"], "shown_bytes": 0,
+                "sha256": saved["source_sha256"], "handle": saved["handle"],
+                "owner_generation": saved["owner_generation"],
+            }
+        elif entries:
+            result["view_status"] = "partial_unrecoverable"
+            result["view_error_code"] = code
+        for index, location, text in entries:
+            preview, shown = _text_prefix(text, 96)
+            notice = ("diagnostic incomplete; see views.diagnostics" if saved
+                      else "diagnostic incomplete; full source unavailable")
+            replace(result, location, preview + f"\n... [{notice}]")
+            view = {"location": location, "kind": "stored" if saved else "unavailable",
+                    "complete": False, "total_bytes": _text_byte_length(text), "shown_bytes": shown}
+            if saved:
+                start, stop = spans[index]
+                view.update(sha256=saved["source_sha256"], handle=saved["handle"],
+                            owner_generation=saved["owner_generation"], span_start=start, span_end=stop)
+            else:
+                view["reason"] = code
+            result["views"][location] = view
+        if saved and not any(view.get("kind") == "unavailable" for view in result["views"].values()):
+            result["view_status"] = "partial_recoverable"
+            result.pop("view_error_code", None)
+        return result
+
+    def final_form(result: dict[str, Any]) -> dict[str, Any]:
+        try:
+            fits = _output_view_fits(result)
+        except (UnicodeError, TypeError):
+            fits = False
+        return result if fits else _project_oversized_result(result)
+
+    # A reference can itself force further omissions. Grow the finite source
+    # set to a fixed point before a single lock-free snapshot registration.
+    for _ in range(len(sources) + 1):
+        entries = [(index, location, sources[location])
+                   for index, location in enumerate(loc for loc in sources if loc in chosen)]
+        transcript, spans, code, planned_saved = "", [], None, None
+        if entries:
+            try:
+                transcript, spans = _feedback_transcript(entries, kind="diagnostics")
+                planned_saved = {
+                    "handle": "H" * 195, "source_sha256": "a" * 64,
+                    "owner_generation": "g" * 32, "total_bytes": spans[-1][1],
+                }
+            except OutputStoreError as exc:
+                code = exc.code
+        forecast = final_form(represented(entries, planned_saved, spans, code))
+        omitted = {loc for loc, text in sources.items()
+                   if loc not in chosen and displayed(forecast, loc) != text}
+        if not omitted:
+            break
+        chosen.update(omitted)
+    else:  # Each non-final pass added at least one of the finite sources.
+        raise AssertionError("Diagnostic omission planning did not converge.")
+    if not entries:
+        return forecast
+
+    saved = None
+    if code is None:
+        try:
+            owner = _output_owner(ctx)
+            store = await asyncio.to_thread(_get_output_store, ctx.lifespan_context, workspace)
+            saved = await asyncio.to_thread(
+                store.save, transcript, owner_session=owner, workspace=workspace,
+                origin=origin + "_diagnostics",
+                segments=[(index, start, stop)
+                          for (index, _location, _text), (start, stop) in zip(entries, spans)],
+            )
+        except OutputStoreError as exc:
+            code = exc.code
+    return final_form(represented(entries, saved, spans, code))
+
+
+def _batch_invalid_text_result(result: dict[str, Any], kind: str) -> dict[str, Any]:
+    """Preserve execution status if upstream feedback cannot encode as UTF-8."""
+    header = {key: result[key] for key in (
+        "success", "reason", "state_id", "from_state_id", "last_valid_state_id",
+        "partial", "commands_run", "command_index", "proof_finished",
+        "service_generation", "warning_filter",
+    ) if key in result}
+    header.update({
+        "schema_version": 1, "view_status": "partial_unrecoverable",
+        "view_error_code": "invalid_text",
+        "views": {"feedback": {
+            "location": "feedback", "kind": "unavailable", "complete": False,
+            "total_bytes": None, "shown_bytes": 0, "reason": "invalid_text",
+        }},
+    })
+    for name in ("failed_command", "error", "stale_warning"):
+        value = result.get(name)
+        if not isinstance(value, str):
+            continue
+        try:
+            length = _text_byte_length(value)
+        except UnicodeError:
+            header["views"][name] = {
+                "location": name, "kind": "unavailable", "complete": False,
+                "total_bytes": None, "shown_bytes": 0, "reason": "invalid_text",
+            }
+            continue
+        if length <= 1024:
+            header[name] = value
+        else:
+            preview, shown = _text_prefix(value, 256)
+            header[name] = preview + "\n... [diagnostic incomplete]"
+            header["views"][name] = {
+                "location": name, "kind": "unavailable", "complete": False,
+                "total_bytes": length, "shown_bytes": shown,
+                "reason": "view_unavailable",
+            }
+    if kind == "rocq_step_multi":
+        for collection in ("results", "partial_results"):
+            if collection in result:
+                header[collection] = [
+                    {key: item[key] for key in ("success", "reason", "proof_finished") if key in item}
+                    for item in result[collection]
+                ]
+    return header
+
+
+async def _live_goal_view(
+    response: dict[str, Any], *, ctx: Context, state_id: int | None,
+    field: str = "goals",
+) -> dict[str, Any]:
+    """Attach a registered state selector when default goal text is cut."""
+    response = dict(response)
+    response.setdefault("schema_version", 1)
+    response.setdefault("view_status", "complete")
+    response["views"] = dict(response.get("views", {}))
+    text = response.get(field)
+    if not isinstance(text, str) or not text:
+        return response
+    try:
+        original_bytes = _text_byte_length(text)
+    except UnicodeError:
+        # Coq already returned this execution/state. Only its printed source
+        # failed; do not let a start wrapper lose that successful receipt.
+        response[field] = "[goal is not valid UTF-8; full view unavailable]"
+        response["views"][field] = {
+            "location": field, "kind": "unavailable", "complete": False,
+            "total_bytes": None, "shown_bytes": 0, "reason": "invalid_text",
+        }
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = "invalid_text"
+        try:
+            fits = _output_view_fits(response)
+        except UnicodeError:
+            fits = False
+        if not fits:
+            response = _project_oversized_result(response)
+            response["view_error_code"] = "invalid_text"
+        return response
+    clipped = (
+        "[clipped " in text or "... (truncated," in text
+        or response["views"].get(field, {}).get("kind") == "unavailable"
+    )
+    invalid_metadata = False
+    try:
+        fits = _output_view_fits(response)
+    except UnicodeError:
+        fits, invalid_metadata = False, True
+    if not clipped and fits:
+        return response
+
+    preview, shown = _text_prefix(text, 2048)
+    response[field] = preview + "\n... [goal incomplete; use rocq_get_goal_roster/part]"
+    try:
+        generation = _output_owner(ctx)
+        if state_id is None:
+            raise OutputStoreError("not_found", "No registered goal state is available.")
+        response["views"][field] = {
+            "location": field, "kind": "live_state", "complete": False,
+            "total_bytes": None if clipped else original_bytes, "shown_bytes": shown,
+            "owner_generation": generation, "state_id": state_id,
+        }
+        if response["view_status"] == "complete":
+            response["view_status"] = "partial_recoverable"
+        if response.get("view_error_code") == "view_unavailable":
+            if not any(view.get("kind") == "unavailable" for view in response["views"].values()):
+                response["view_status"] = "partial_recoverable"
+                response.pop("view_error_code", None)
+    except OutputStoreError as exc:
+        response["views"][field] = {
+            "location": field, "kind": "unavailable", "complete": False,
+            "total_bytes": None if clipped else original_bytes, "shown_bytes": shown,
+            "reason": exc.code,
+        }
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = exc.code
+
+    if invalid_metadata:
+        # The goal text itself was valid. Clean the separate bad field only
+        # after attaching its live source, instead of mislabelling the goal.
+        response = _project_oversized_result(response)
+        response["view_error_code"] = "invalid_text"
+        return response
+    while not _output_view_fits(response) and shown > 0:
+        preview, shown = _text_prefix(preview, max(1, shown // 2))
+        response[field] = preview + "\n... [goal incomplete; use rocq_get_goal_roster/part]"
+        response["views"][field]["shown_bytes"] = shown
+    if not _output_view_fits(response):
+        response[field] = "[goal view unavailable: response budget exceeded]"
+        response["views"][field] = {
+            "location": field, "kind": "unavailable", "complete": False,
+            "total_bytes": None if clipped else original_bytes, "shown_bytes": 0,
+            "reason": "view_unavailable",
+        }
+        response["view_status"] = "partial_unrecoverable"
+        response["view_error_code"] = "view_unavailable"
+    return response
 
 
 def _finalize_tool_envelope(
@@ -1653,6 +2992,9 @@ async def _run_with_pet(
     partial_state: dict[str, Any] | None = None,
     *,
     auto_record: bool = True,
+    workspace: str | None = None,
+    from_state: int | None = None,
+    workspace_update: bool = False,
 ) -> Any:
     """Run *fn(pet)* with the pet client, handling lock/semaphore/timeout/errors.
 
@@ -1720,8 +3062,56 @@ async def _run_with_pet(
         if not lock.acquire(timeout=lock_timeout):
             raise _PetLockTimeout("Could not acquire pet lock")
         try:
+            selected_workspace = workspace
+            if from_state is not None:
+                from rocq_mcp.interactive import _state_get
+                entry = _state_get(from_state)
+                if entry is not None:
+                    selected_workspace = entry.workspace
+                elif os.environ.get("ROCQ_WORKSPACE_UPDATES") == "1":
+                    from rocq_mcp.interactive import _invalidated_response
+                    return _invalidated_response(from_state, lifespan_state, tool) or _fail(
+                        lifespan_state, tool, "State is no longer live; start from saved source.",
+                        reason="state_invalidated")
+            watch = bool(selected_workspace) and (workspace_update or os.environ.get("ROCQ_WORKSPACE_UPDATES") == "1")
+            signal = None
+            if watch:
+                try:
+                    signal = read_signal(selected_workspace)
+                except (WorkspaceUpdateError, OSError) as exc:
+                    return _fail(lifespan_state, tool, str(exc), reason="unavailable")
+                if signal["updating"]:
+                    return _fail(lifespan_state, tool, "Workspace is being updated; resume after the update command finishes.",
+                                 reason="workspace_updating")
             pet = _ensure_pet(lifespan_state)
-            return fn(pet)
+            refreshed = False
+            if watch:
+                try:
+                    refreshed = _prepare_workspace_update(pet, lifespan_state, selected_workspace, signal,
+                                                          force=workspace_update)
+                except WorkspaceUpdateError as exc:
+                    return _fail(lifespan_state, tool, str(exc), reason="unavailable")
+                if refreshed and from_state is not None:
+                    return _fail(lifespan_state, tool, "Workspace dependencies changed; old state invalidated. Start from saved source.",
+                                 reason="state_invalidated", workspace_refreshed=True)
+            result = fn(pet)
+            if watch:
+                try:
+                    after = read_signal(selected_workspace)
+                except (WorkspaceUpdateError, OSError) as exc:
+                    from rocq_mcp.interactive import _invalidate_workspace_states
+                    _invalidate_workspace_states()
+                    lifespan_state["workspace_refresh_failed"] = True
+                    return _updated_during_call(lifespan_state, tool, result, str(exc), reason="unavailable")
+                if after != signal:
+                    from rocq_mcp.interactive import _invalidate_workspace_states
+                    _invalidate_workspace_states()
+                    lifespan_state["workspace_refresh_failed"] = True
+                    return _updated_during_call(lifespan_state, tool, result,
+                                                "Workspace changed during this call; its states cannot be continued.")
+            if refreshed and isinstance(result, dict):
+                result["workspace_refreshed"] = True
+            return result
         finally:
             lock.release()
 
@@ -1868,6 +3258,8 @@ from rocq_mcp.interactive import (  # noqa: E402
     run_step_multi,
     run_toc,
     run_notations,
+    run_goal_part,
+    run_goal_roster,
 )
 from rocq_mcp.diag import (  # noqa: E402
     _DIAG_LIVE_STATES_CAP,
@@ -2321,10 +3713,11 @@ async def rocq_query(
             ``dune-project``; falls back to the ``ROCQ_WORKSPACE`` env var
             (default: cwd).
         max_results: Only an explicit positive value limits the number of
-            feedback results, after warning filtering. If omitted or nonpositive,
-            all results are returned. Query output has no internal character
-            truncation. The host/client may impose separate output limits.
-            Useful for broad Search patterns.
+            feedback messages *initially displayed*, after warning filtering.
+            One message may contain many Search matches; this is not lemma
+            pagination. All filtered messages remain searchable through an
+            owned handle if any are omitted or the response exceeds its byte
+            budget. Use rocq_find_output / rocq_read_output to inspect them.
         include_warnings: If True (default), include all feedback returned
             by the query.  If False, drop entries at LSP Warning severity
             so warning noise does not crowd out tool output.
@@ -2358,8 +3751,28 @@ async def rocq_query(
         include_warnings=include_warnings,
         timeout=effective_timeout,
         from_state=from_state,
+        capture_feedback=True,
     )
-    return _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+    if not isinstance(result, dict) or "_all_feedback" not in result:
+        finished = _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+        if isinstance(finished, dict) and ctx is not None:
+            return await _diagnostic_views(
+                finished, original=result, ctx=ctx, workspace=workspace, origin="rocq_query",
+            )
+        return finished
+    # Step P4: The raw internal field must never enter either MCP channel.
+    full = result.pop("_all_feedback")
+    shown = result.pop("_shown_feedback")
+    total = result.pop("_feedback_messages")
+    displayed = result.pop("_shown_messages")
+    finished = _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+    assert ctx is not None and lifespan_state is not None
+    return await _query_result_view(
+        finished, full=full, shown=shown, total_messages=total,
+        shown_messages=displayed, state=lifespan_state, ctx=ctx,
+        workspace=workspace,
+        warning_filter=WARNING_FILTER_INCLUDE if include_warnings else WARNING_FILTER_EXCLUDE,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2473,7 +3886,8 @@ async def rocq_toc(
 
     Returns a hierarchical outline showing what is defined in the file.
     Useful for understanding a file before working with it, or finding
-    the name of a theorem to prove.
+    the name of a theorem to prove. Large outlines return a bounded view
+    and an owned handle for rocq_find_output / rocq_read_output.
 
     Does NOT require a rocq_start session.
 
@@ -2506,8 +3920,23 @@ async def rocq_toc(
         workspace=workspace,
         lifespan_state=lifespan_state,
         timeout=effective_timeout,
+        capture_output=True,
     )
-    return _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+    if not isinstance(result, dict) or "_all_output" not in result:
+        finished = _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+        if isinstance(finished, dict) and ctx is not None:
+            return await _diagnostic_views(
+                finished, original=result, ctx=ctx, workspace=workspace, origin="rocq_toc",
+            )
+        return finished
+    full = result.pop("_all_output")
+    shown = result.pop("_shown_output")
+    finalized = _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+    assert ctx is not None and lifespan_state is not None
+    return await _query_result_view(
+        finalized, full=full, shown=shown, state=lifespan_state,
+        ctx=ctx, workspace=workspace, origin="rocq_toc",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2533,6 +3962,8 @@ async def rocq_notations(
     statement="forall n, n + 0 = n".
 
     NOTE: Only works on statements (propositions/types), not arbitrary terms.
+    Large outputs return bounded views and owned handles for explicit
+    rocq_find_output / rocq_read_output calls.
 
     Args:
         statement: The proposition/type to analyze.
@@ -2562,8 +3993,23 @@ async def rocq_notations(
         workspace=workspace,
         lifespan_state=lifespan_state,
         timeout=effective_timeout,
+        capture_output=True,
     )
-    return _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+    if not isinstance(result, dict) or "_all_output" not in result:
+        finished = _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+        if isinstance(finished, dict) and ctx is not None:
+            return await _diagnostic_views(
+                finished, original=result, ctx=ctx, workspace=workspace, origin="rocq_notations",
+            )
+        return finished
+    full = result.pop("_all_output")
+    shown = result.pop("_shown_output")
+    finalized = _finalize_tool_envelope(result, clamped=clamped, ws_warning=ws_warning)
+    assert ctx is not None and lifespan_state is not None
+    return await _query_result_view(
+        finalized, full=full, shown=shown, state=lifespan_state,
+        ctx=ctx, workspace=workspace, origin="rocq_notations",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2589,6 +4035,11 @@ async def rocq_start(
     Returns a state_id for use with rocq_check and rocq_step_multi.
     Also returns the current proof goals at the starting position,
     so this tool can be used to inspect goals at any point in a file.
+    Long goals are only previewed: ``views.goals`` then identifies the live
+    state.  Pass the returned ``service_generation`` and ``state_id`` to
+    ``rocq_get_goal_roster`` / ``rocq_get_goal_part`` for exact hypotheses
+    and conclusions.  A file edit, dependency change or evicted state
+    invalidates that read; a printed preview is not a reusable proof state.
     For a position inside a proof, the response also carries
     ``focus_depth`` — how many ``{...}`` / bullet focus frames are open
     above the goal (0 at the top level) — so a session resumed mid-proof
@@ -2674,11 +4125,11 @@ async def rocq_start(
             (default: ``ROCQ_MAX_GOAL_CHARS``, 12000).  Oversized goals are
             clipped structurally: every hypothesis keeps its name and the
             conclusion keeps its head+tail, only bodies are sliced, and each
-            cut carries an explicit ``[clipped N of M chars]`` marker.  Pass
-            ``-1`` for the full text (the response may then exceed the
-            host's tool-output limit).  The goal text arrives as its own
-            content block with real newlines; the first block is the JSON
-            envelope (``goals_chars`` = size of the text block).
+            cut carries an explicit ``[clipped N of M chars]`` marker.  ``-1``
+            bypasses internal formatting clips, but the MCP reply remains
+            byte-bounded.  Use the live goal selector for any omitted text.
+            The displayed goal preview arrives as its own content block;
+            the first block is the JSON envelope (``goals_chars`` = preview size).
 
     On theorem-not-found errors: response includes ``available_in_file:
     list[str]`` with the file's defined names (sorted, capped — see
@@ -2711,10 +4162,19 @@ async def rocq_start(
         timeout=effective_timeout,
         goals_max_chars=goals_max_chars,
     )
-    return _finalize_tool_envelope(
+    response = _finalize_tool_envelope(
         result, clamped=clamped, ws_warning=ws_warning,
         timeout_cap=ROCQ_START_TIMEOUT if file else ROCQ_QUERY_TIMEOUT_CAP,
     )
+    if isinstance(response, dict) and response.get("success") and "state_id" in response:
+        if lifespan_state.get("output_stdio"):
+            response["service_generation"] = lifespan_state["output_principal"]
+        return await _live_goal_view(response, ctx=ctx, state_id=response["state_id"])
+    if isinstance(response, dict) and ctx is not None:
+        return await _diagnostic_views(
+            response, original=result, ctx=ctx, workspace=workspace, origin="rocq_start",
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -2752,6 +4212,12 @@ async def rocq_step_multi(
 
     Each result entry includes a ``feedback`` field (truncated string)
     when the tactic produces visible output (e.g., ``Print``, ``Search``).
+    Large feedback is saved by candidate index: use ``views.feedback.handle``
+    with ``rocq_list_output_segments`` and ``rocq_read_output``.  Large
+    candidate goals instead use ``views.candidate_goals.handle``; these
+    are printed snapshots, not live states or a proof to continue from.
+    Long Coq errors use ``views.diagnostics.handle`` with the same index
+    and byte-range tools; a shortened ``error`` is never the full error.
     Each *successful* entry also carries a ``focus_depth`` field — how
     many ``{...}`` / bullet focus frames that tactic leaves open above
     the goal (0 at the top level).
@@ -2790,8 +4256,9 @@ async def rocq_step_multi(
             result entry (default: ``ROCQ_MAX_GOAL_CHARS``, 12000).
             Oversized goals are clipped structurally (hypothesis names and
             the conclusion head+tail survive; bodies are sliced with an
-            explicit ``[clipped N of M chars]`` marker).  Pass ``-1`` for
-            the full text.
+             explicit ``[clipped N of M chars]`` marker).  ``-1`` bypasses
+             internal formatting clips; the MCP reply remains byte-bounded
+             and may provide a snapshot handle rather than inline full text.
 
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
@@ -2808,9 +4275,30 @@ async def rocq_step_multi(
         include_warnings=include_warnings,
         timeout=effective_timeout,
         goals_max_chars=goals_max_chars,
+        capture_feedback=True,
     )
     if clamped:
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
+    if isinstance(result, dict) and "_raw_feedback" in result:
+        original = dict(result)
+        raw = result.pop("_raw_feedback")
+        raw_goals = result.pop("_raw_candidate_goals", [])
+        saved_workspace = result.pop("_feedback_workspace", ROCQ_WORKSPACE)
+        try:
+            projected = await _batch_feedback_view(
+                result, entries=raw, kind="rocq_step_multi", ctx=ctx,
+                workspace=saved_workspace,
+                warning_filter=WARNING_FILTER_INCLUDE if include_warnings else WARNING_FILTER_EXCLUDE,
+            )
+        except UnicodeError:
+            projected = _batch_invalid_text_result(result, "rocq_step_multi")
+        projected = await _candidate_goal_view(
+            projected, entries=raw_goals, ctx=ctx, workspace=saved_workspace,
+        )
+        return await _diagnostic_views(
+            projected, original=original, ctx=ctx, workspace=saved_workspace,
+            origin="rocq_step_multi",
+        )
     return result
 
 
@@ -2854,7 +4342,14 @@ async def rocq_check(
     When commands produce visible output (e.g., ``Print``, ``Check``,
     ``vm_compute``, ``native_compute``), a ``feedback`` field is included
     as a list of ``[command, output]`` pairs (truncated per step at 50K
-    chars).  Omitted when no command produces output.
+    chars).  When truncated, ``views.feedback.handle`` plus
+    ``rocq_list_output_segments`` and ``rocq_read_output`` recover each
+    original command output.  Omitted when no command produces output.
+    A large failed-command diagnostic is saved separately as
+    ``views.diagnostics.handle``; check the indexed ``views.error`` span
+    before drawing conclusions from a first-screen error preview.
+    For a large goal, use ``service_generation`` with the returned live
+    ``state_id`` in ``rocq_get_goal_roster`` / ``rocq_get_goal_part``.
 
     When proof goals are available, the success response carries
     ``focus_depth`` — how many ``{...}`` / bullet focus frames are
@@ -2909,10 +4404,12 @@ async def rocq_check(
             (default: ``ROCQ_MAX_GOAL_CHARS``, 12000).  Oversized goals are
             clipped structurally (hypothesis names and the conclusion
             head+tail survive; bodies are sliced with an explicit
-            ``[clipped N of M chars]`` marker).  Pass ``-1`` for the full
-            text.  Goal text arrives as its own content block with real
-            newlines; the first block is the JSON envelope
-            (``goals_chars`` / ``goals_at_failure_chars`` = text sizes).
+            ``[clipped N of M chars]`` marker). ``-1`` bypasses internal
+            formatting clips, but the MCP reply stays bounded; use the
+            live goal selector for omitted text.  The goal preview arrives
+            as its own content block with real newlines; the first block
+            is the JSON envelope (``goals_chars`` /
+            ``goals_at_failure_chars`` = preview sizes).
 
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
@@ -2931,10 +4428,344 @@ async def rocq_check(
         timeout=effective_timeout,
         include_warnings=include_warnings,
         goals_max_chars=goals_max_chars,
+        capture_feedback=True,
     )
     if clamped and isinstance(result, dict):
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
+    if (isinstance(result, dict) and ctx.lifespan_context.get("output_stdio")
+            and ("state_id" in result or "last_valid_state_id" in result)):
+        result["service_generation"] = ctx.lifespan_context["output_principal"]
+    if isinstance(result, dict) and "_raw_feedback" in result:
+        original = dict(result)
+        raw = result.pop("_raw_feedback")
+        saved_workspace = result.pop("_feedback_workspace", ROCQ_WORKSPACE)
+        try:
+            projected = await _batch_feedback_view(
+                result, entries=raw, kind="rocq_check", ctx=ctx,
+                workspace=saved_workspace,
+                warning_filter=WARNING_FILTER_INCLUDE if include_warnings else WARNING_FILTER_EXCLUDE,
+            )
+            field = "goals" if projected.get("success") else "goals_at_failure"
+            goal_state = (projected.get("state_id") if projected.get("success")
+                          else projected.get("last_valid_state_id"))
+            projected = await _live_goal_view(projected, ctx=ctx, state_id=goal_state, field=field)
+        except UnicodeError:
+            projected = _batch_invalid_text_result(result, "rocq_check")
+        return await _diagnostic_views(
+            projected, original=original, ctx=ctx, workspace=saved_workspace,
+            origin="rocq_check",
+        )
     return result
+
+
+@mcp.tool
+async def rocq_find_output(
+    handle: str,
+    literal: str,
+    cursor: int = 0,
+    max_hits: int = MAX_FIND_HITS,
+    workspace: str = "",
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Search a saved Rocq result for a literal; never expose its file path.
+
+    Returns bounded context and byte offsets into the original UTF-8 text.
+    In the supported single-client stdio deployment, a handle belongs to
+    that server generation and its workspace.  Other transports fail closed.
+    Regex and Coq-lemma-level pagination are not implied.
+    """
+    resolved = _resolve_tool_envelope(
+        tool="rocq_find_output", ctx=ctx, workspace=workspace,
+    )
+    if not isinstance(resolved, tuple):
+        return resolved
+    ws, state, warning, _clamped, _timeout = resolved
+    assert ctx is not None and state is not None
+    try:
+        owner = _output_owner(ctx)
+        store = state.get("output_store")
+        if store is None:
+            reject_unregistered_handle(handle)
+        deadline = time.monotonic() + FIND_TIMEOUT_SECONDS
+        limit = max_hits
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OutputStoreError("timeout", "Literal search exceeded its time budget.")
+            result = await asyncio.wait_for(
+                asyncio.to_thread(store.find, handle, literal, owner_session=owner,
+                                  workspace=ws, cursor=cursor, max_hits=limit),
+                timeout=remaining,
+            )
+            response = _finalize_tool_envelope(
+                _output_success(result, handle=handle, generation=store.generation),
+                clamped=False, ws_warning=warning,
+            )
+            if _output_view_fits(response):
+                return response
+            if limit <= 1:
+                raise OutputStoreError("view_unavailable", "Search preview exceeds its response budget.")
+            limit //= 2
+    except asyncio.TimeoutError:
+        return _output_error(state, "rocq_find_output",
+                             OutputStoreError("timeout", "Literal search exceeded its time budget."))
+    except RuntimeError:
+        return _output_error(state, "rocq_find_output",
+                             OutputStoreError("unauthorized", "MCP session is unavailable."))
+    except OutputStoreError as exc:
+        return _output_error(state, "rocq_find_output", exc)
+
+
+@mcp.tool
+async def rocq_read_output(
+    handle: str,
+    offset_bytes: int,
+    max_bytes: int = MAX_READ_BYTES,
+    workspace: str = "",
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Read a bounded, byte-exact UTF-8 slice of an owned saved result.
+
+    ``offset_bytes`` is zero-based.  ``status='eof'`` with empty text is
+    success only when the offset equals the original length; missing,
+    expired, unauthorized and ill-aligned output fail explicitly.
+    """
+    resolved = _resolve_tool_envelope(
+        tool="rocq_read_output", ctx=ctx, workspace=workspace,
+    )
+    if not isinstance(resolved, tuple):
+        return resolved
+    ws, state, warning, _clamped, _timeout = resolved
+    assert ctx is not None and state is not None
+    try:
+        owner = _output_owner(ctx)
+        store = state.get("output_store")
+        if store is None:
+            reject_unregistered_handle(handle)
+        deadline = time.monotonic() + FIND_TIMEOUT_SECONDS
+        limit = max_bytes
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise OutputStoreError("timeout", "Output read exceeded its time budget.")
+            result = await asyncio.wait_for(
+                asyncio.to_thread(store.read, handle, owner_session=owner,
+                                  workspace=ws, offset_bytes=offset_bytes, max_bytes=limit),
+                timeout=remaining,
+            )
+            response = _finalize_tool_envelope(
+                _output_success(result, handle=handle, generation=store.generation),
+                clamped=False, ws_warning=warning,
+            )
+            if _output_view_fits(response):
+                return response
+            if limit <= 1:
+                raise OutputStoreError("view_unavailable", "Output slice exceeds its response budget.")
+            limit //= 2
+    except asyncio.TimeoutError:
+        return _output_error(state, "rocq_read_output",
+                             OutputStoreError("timeout", "Output read exceeded its time budget."))
+    except RuntimeError:
+        return _output_error(state, "rocq_read_output",
+                             OutputStoreError("unauthorized", "MCP session is unavailable."))
+    except OutputStoreError as exc:
+        return _output_error(state, "rocq_read_output", exc)
+
+
+@mcp.tool
+async def rocq_list_output_segments(
+    handle: str,
+    cursor: int = 0,
+    max_entries: int = 20,
+    workspace: str = "",
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Page trusted spans of a saved feedback, candidate-goal or error batch.
+
+    Segment offsets belong to the same original bytes served by
+    ``rocq_read_output``.  A textual marker inside Rocq feedback is not an
+    authoritative index.  Non-batch output has no segment list.
+    """
+    resolved = _resolve_tool_envelope(
+        tool="rocq_list_output_segments", ctx=ctx, workspace=workspace,
+    )
+    if not isinstance(resolved, tuple):
+        return resolved
+    ws, state, warning, _clamped, _timeout = resolved
+    assert ctx is not None and state is not None
+    try:
+        owner = _output_owner(ctx)
+        store = state.get("output_store")
+        if store is None:
+            reject_unregistered_handle(handle)
+        result = await asyncio.wait_for(
+            asyncio.to_thread(store.list_segments, handle, owner_session=owner,
+                              workspace=ws, cursor=cursor, max_entries=max_entries),
+            timeout=FIND_TIMEOUT_SECONDS,
+        )
+        response = _finalize_tool_envelope(
+            _output_success(result, handle=handle, generation=store.generation),
+            clamped=False, ws_warning=warning,
+        )
+        if not _output_view_fits(response):
+            raise OutputStoreError("view_unavailable", "Segment page exceeds its response budget.")
+        return response
+    except asyncio.TimeoutError:
+        return _output_error(state, "rocq_list_output_segments",
+                             OutputStoreError("timeout", "Segment lookup exceeded its time budget."))
+    except OutputStoreError as exc:
+        return _output_error(state, "rocq_list_output_segments", exc)
+
+
+@mcp.tool
+async def rocq_get_goal_part(
+    from_state: int,
+    group: str,
+    goal_index: int,
+    part: str,
+    service_generation: str,
+    depth: int | None = None,
+    hyp_index: int | None = None,
+    offset_bytes: int = 0,
+    max_bytes: int = MAX_READ_BYTES,
+    timeout: int = 0,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Read a bounded hypothesis name/type/definition or goal conclusion.
+
+    Supply the generation echoed by rocq_start/check or the GoalRef.
+    Only registered, live proof states are valid.  ``group`` selects
+    focused/stack_left/stack_right/shelved/given_up; stack groups require
+    a 1-based depth, and goals/hypotheses have 1-based indices.  This is a
+    read-only view, not a new executable state or a proof of the goal.
+    Invalid UTF-8 goal text reports view_error_code=invalid_text while
+    retaining the successfully read state and its proof_finished fact.
+    """
+    if ctx is None:
+        return _no_ctx_fail("rocq_get_goal_part")
+    state = ctx.lifespan_context
+    try:
+        generation = _output_owner(ctx)
+    except OutputStoreError as exc:
+        return _output_error(state, "rocq_get_goal_part", exc)
+    if service_generation != generation:
+        return _output_error(state, "rocq_get_goal_part",
+                             OutputStoreError("expired", "Goal state belongs to another service generation."))
+    effective_timeout, clamped = _resolve_call_timeout(timeout)
+    result = await run_goal_part(
+        from_state, group, goal_index, part, state,
+        depth=depth, hyp_index=hyp_index, offset_bytes=offset_bytes,
+        max_bytes=max_bytes, timeout=effective_timeout,
+    )
+    if not result.get("success") or result.get("view_error_code") == "invalid_text":
+        response = {"schema_version": 1, "view_status": "complete", "views": {}, **result}
+        if clamped:
+            response["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
+        return response
+
+    response = _output_success(result)
+    if clamped:
+        response["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
+    while True:
+        if response["has_more"] or response["start"] > 0:
+            response["view_status"] = "partial_recoverable"
+            response["views"]["source"] = {
+                "location": "source", "kind": "live_state", "complete": False,
+                "total_bytes": response["total_bytes"],
+                "shown_bytes": len(response["text"].encode("utf-8")),
+                "owner_generation": generation,
+                "state_id": response["state_id"], "selector": response["selector"],
+                "sha256": response["digest"],
+            }
+        if _output_view_fits(response):
+            return response
+        prefix, consumed = _text_prefix(response["text"], len(response["text"].encode("utf-8")) // 2)
+        if consumed == 0:
+            return _output_error(state, "rocq_get_goal_part",
+                                 OutputStoreError("view_unavailable", "Goal fragment exceeds the response budget."))
+        response["text"] = prefix
+        response["end"] = response["start"] + consumed
+        response["has_more"] = response["end"] < response["total_bytes"]
+        response["views"]["text"]["total_bytes"] = consumed
+        response["views"]["text"]["shown_bytes"] = consumed
+
+
+@mcp.tool
+async def rocq_get_goal_roster(
+    from_state: int,
+    service_generation: str,
+    group: str = "focused",
+    depth: int | None = None,
+    cursor: int = 0,
+    max_goals: int = 5,
+    max_hyps: int = 8,
+    timeout: int = 0,
+    ctx: Context = None,
+) -> dict[str, Any]:
+    """Page the active state's goal/hyp names and group counts.
+
+    Use rocq_get_goal_part for the complete type/definition/conclusion.
+    Stack groups require a 1-based depth.  This only inspects an existing
+    proof state and does not register a new one.
+    Unencodable goal text gives an unavailable view, not empty goals or
+    a new Rocq execution failure.
+    """
+    if ctx is None:
+        return _no_ctx_fail("rocq_get_goal_roster")
+    state = ctx.lifespan_context
+    try:
+        generation = _output_owner(ctx)
+    except OutputStoreError as exc:
+        return _output_error(state, "rocq_get_goal_roster", exc)
+    if service_generation != generation:
+        return _output_error(state, "rocq_get_goal_roster",
+                             OutputStoreError("expired", "Goal state belongs to another service generation."))
+    effective_timeout, clamped = _resolve_call_timeout(timeout)
+    result = await run_goal_roster(
+        from_state, group, state, depth=depth, cursor=cursor,
+        max_goals=max_goals, max_hyps=max_hyps, timeout=effective_timeout,
+    )
+    if not result.get("success") or result.get("view_error_code") == "invalid_text":
+        response = {"schema_version": 1, "view_status": "complete", "views": {}, **result}
+        if clamped:
+            response["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
+        return response
+    response = {"schema_version": 1, "view_status": "complete", "views": {}, **result}
+    if clamped:
+        response["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
+    if result["roster_truncated"]:
+        response["view_status"] = "partial_recoverable"
+        response["views"]["roster"] = {
+            "location": "roster", "kind": "live_state", "complete": False,
+            "total_bytes": None, "shown_bytes": 0,
+            "owner_generation": generation,
+            "state_id": from_state, "group": group, "depth": depth,
+        }
+    if not _output_view_fits(response):
+        return _output_error(state, "rocq_get_goal_roster",
+                             OutputStoreError("view_unavailable", "Roster page exceeds response budget."))
+    return response
+
+
+@mcp.tool
+async def rocq_workspace_update(workspace: str = "", timeout: int = 0,
+                                ctx: Context = None) -> dict[str, Any]:
+    """Refresh native Pet libraries/documents and invalidate old Python states.
+
+    Use after an explicitly completed external dependency update. This keeps
+    the Pet PID; old state IDs are invalid. CCV's update wrapper normally
+    publishes the notification automatically. It does not replay proofs.
+    """
+    resolved = _resolve_tool_envelope(tool="rocq_workspace_update", ctx=ctx,
+                                      workspace=workspace, timeout=timeout)
+    if not isinstance(resolved, tuple):
+        return resolved
+    ws, state, warning, clamped, effective = resolved
+    result = await _run_with_pet(
+        lambda _pet: {"success": True, "workspace": ws, "states_invalidated": True},
+        state, "rocq_workspace_update", timeout=effective, workspace=ws, workspace_update=True,
+    )
+    return _finalize_tool_envelope(result, clamped=clamped, ws_warning=warning)
 
 
 @mcp.tool
@@ -2995,6 +4826,8 @@ async def rocq_diag(ctx: Context = None) -> dict[str, Any]:
         ``"axiom_dependency"``, ``"type_mismatch"``.
 
       The full set is :data:`_RECENT_ERROR_REASONS`.
+      ``workspace_updating`` means a configured CCV update is still pending;
+      no new proof command was executed against that changing environment.
     """
     if ctx is None:
         return _no_ctx_fail("rocq_diag")
@@ -3201,6 +5034,8 @@ async def rocq_switch(name: str = "", ctx: Context = None) -> dict[str, Any]:
 
 def main() -> None:
     """Run the MCP server."""
+    global _output_stdio_mode
+    _output_stdio_mode = True
     mcp.run(transport="stdio")
 
 
