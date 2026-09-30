@@ -102,6 +102,27 @@ async def test_one_large_search_message_gets_short_dual_channel_receipt(query_co
 
 
 @pytest.mark.asyncio
+async def test_held_worker_state_owns_query_snapshot_not_server_default(query_context, monkeypatch):
+    ws, pet, ctx, store = query_context
+    worker = ws / "worker/proof"
+    worker.mkdir(parents=True)
+    (worker / "_CoqProject").write_text('-Q . ""\n')
+    sid = interactive._state_add(SimpleNamespace(proof_finished=False), "Worker.v", "goal",
+                                 str(worker), None, None, 0)
+    monkeypatch.setattr(server, "ROCQ_WORKSPACE", str(ws))
+    monkeypatch.setattr(server, "_set_workspace_if_needed", lambda *_: None)
+    monkeypatch.setattr(interactive, "_check_staleness", lambda *_: None)
+    pet.feedback = [(3, "X" * 50_000 + "WORKER_QUERY_TAIL")]
+    result = await server.rocq_query("Show.", from_state=sid, ctx=ctx)
+    handle = result["views"]["output"]["handle"]
+    assert store._entries[handle].workspace == str(worker)
+    found = await server.rocq_find_output(handle, "WORKER_QUERY_TAIL", workspace=str(worker), ctx=ctx)
+    assert found["success"] and found["hits"]
+    denied = await server.rocq_read_output(handle, 0, workspace=str(ws), ctx=ctx)
+    assert not denied["success"] and denied["view_error_code"] == "unauthorized"
+
+
+@pytest.mark.asyncio
 async def test_max_results_omission_saves_both_short_feedback_messages(query_context):
     ws, pet, ctx, store = query_context
     pet.feedback = [(3, "FIRST_RESULT"), (3, "SECOND_ONLY_IN_SNAPSHOT")]

@@ -3734,6 +3734,13 @@ async def rocq_query(
     On ``pet_restarted: True``, call ``rocq_diag`` for memory headroom and
     recent error history.
     """
+    # A held state owns its workspace, including any printed snapshot made by
+    # this query. The server default may be the run root, not its worktree.
+    if from_state is not None:
+        from rocq_mcp.interactive import _state_get
+        entry = _state_get(from_state)
+        if entry is not None:
+            workspace = entry.workspace
     resolved = _resolve_tool_envelope(
         tool="rocq_query", ctx=ctx, workspace=workspace, file=file, timeout=timeout
     )
