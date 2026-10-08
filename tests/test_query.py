@@ -405,7 +405,7 @@ class TestGetFileEndState:
     """Unit tests for _get_file_end_state edge cases."""
 
     def test_no_trailing_newline_line_count(self, tmp_path):
-        """File without trailing newline should still position past the last line."""
+        """无尾换行时取最后一行的真实 EOF，不请求越界行。"""
         from rocq_mcp.interactive import _get_file_end_state
         from unittest.mock import MagicMock
 
@@ -420,13 +420,13 @@ class TestGetFileEndState:
         result = _get_file_end_state(mock_pet, "test.v", str(tmp_path), lifespan_state)
 
         assert result is mock_state
-        # end_line should be 1 (count("\n") + 1 = 0 + 1), not 0
-        mock_pet.get_state_at_pos.assert_called_once()
-        call_args = mock_pet.get_state_at_pos.call_args
-        assert call_args[0][1] == 1  # line argument
+        mock_pet.get_state_at_pos.assert_called_once_with(
+            str(vfile.resolve()), 0, len("Definition x := 1."),
+        )
+        mock_pet.get_root_state.assert_not_called()
 
     def test_with_trailing_newline_line_count(self, tmp_path):
-        """File with trailing newline should position past the last line."""
+        """尾换行后的 EOF 是下一空行的零列。"""
         from rocq_mcp.interactive import _get_file_end_state
         from unittest.mock import MagicMock
 
@@ -441,12 +441,11 @@ class TestGetFileEndState:
         result = _get_file_end_state(mock_pet, "test.v", str(tmp_path), lifespan_state)
 
         assert result is mock_state
-        # end_line should be 2 (count("\n") + 1 = 1 + 1)
-        call_args = mock_pet.get_state_at_pos.call_args
-        assert call_args[0][1] == 2
+        mock_pet.get_state_at_pos.assert_called_once_with(str(vfile.resolve()), 1, 0)
+        mock_pet.get_root_state.assert_not_called()
 
     def test_empty_file_line_count(self, tmp_path):
-        """Empty file should position at line 1."""
+        """空文档无 AST node，显式取 root，不以越界定位代替。"""
         from rocq_mcp.interactive import _get_file_end_state
         from unittest.mock import MagicMock
 
@@ -455,14 +454,33 @@ class TestGetFileEndState:
 
         mock_pet = MagicMock()
         mock_state = MagicMock()
-        mock_pet.get_state_at_pos.return_value = mock_state
+        mock_pet.get_root_state.return_value = mock_state
 
         lifespan_state = _make_lifespan_state()
         result = _get_file_end_state(mock_pet, "test.v", str(tmp_path), lifespan_state)
 
         assert result is mock_state
-        call_args = mock_pet.get_state_at_pos.call_args
-        assert call_args[0][1] == 1  # 0 + 1
+        mock_pet.get_root_state.assert_called_once_with(str(vfile.resolve()))
+        mock_pet.get_state_at_pos.assert_not_called()
+
+    @pytest.mark.parametrize("content,line,character", [
+        ("(* 🙂 *)", 0, 8),
+        ("(* a *)\r\n(* 🙂 *)", 1, 8),
+        ("(* a *)\r(* 🙂 *)", 0, 16),
+    ])
+    def test_eof_preserves_raw_newlines_and_utf16_columns(
+        self, tmp_path, content, line, character,
+    ):
+        from rocq_mcp.interactive import _get_file_end_state
+        from unittest.mock import MagicMock
+
+        vfile = tmp_path / "test.v"
+        vfile.write_bytes(content.encode("utf-8"))
+        mock_pet = MagicMock()
+        result = _get_file_end_state(mock_pet, "test.v", str(tmp_path), _make_lifespan_state())
+        assert result is mock_pet.get_state_at_pos.return_value
+        mock_pet.get_state_at_pos.assert_called_once_with(str(vfile.resolve()), line, character)
+        mock_pet.get_root_state.assert_not_called()
 
     def test_skips_workspace_reset_when_unchanged(self, tmp_path):
         """File mode delegates workspace management to
@@ -499,9 +517,13 @@ class TestGetFileEndState:
         mock_pet = MagicMock()
         lifespan_state = _make_lifespan_state()
 
-        with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
-            with pytest.raises(FileNotFoundError, match="not accessible"):
+        with patch.object(Path, "read_bytes", side_effect=PermissionError("denied")) as read:
+            with pytest.raises(FileNotFoundError, match="not accessible") as caught:
                 _get_file_end_state(mock_pet, "secret.v", str(tmp_path), lifespan_state)
+        read.assert_called_once()
+        assert str(tmp_path) not in str(caught.value)
+        mock_pet.get_state_at_pos.assert_not_called()
+        mock_pet.get_root_state.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

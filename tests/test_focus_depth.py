@@ -64,12 +64,22 @@ class TestGoalsWithDepth:
         _text, depth = _try_get_goals_with_depth(mock_pet, object())
         assert depth == 2
 
-    def test_failure_returns_none_none(self):
+    def test_failure_propagates_instead_of_reporting_empty_goals(self):
         from rocq_mcp.interactive import _try_get_goals_with_depth
 
         mock_pet = MagicMock()
-        mock_pet.complete_goals.side_effect = RuntimeError("boom")
-        assert _try_get_goals_with_depth(mock_pet, object()) == (None, None)
+        error = RuntimeError("boom")
+        mock_pet.complete_goals.side_effect = error
+        with pytest.raises(RuntimeError, match="boom") as caught:
+            _try_get_goals_with_depth(mock_pet, object())
+        assert caught.value is error
+
+    def test_actual_empty_goals_return_none_and_zero_depth(self):
+        from rocq_mcp.interactive import _try_get_goals_with_depth
+
+        mock_pet = MagicMock()
+        mock_pet.complete_goals.return_value = _fake_goals(0, n_goals=0)
+        assert _try_get_goals_with_depth(mock_pet, object()) == (None, 0)
 
 
 class TestFocusDepthCheck(_MockPetBase):

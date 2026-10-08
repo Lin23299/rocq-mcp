@@ -778,7 +778,8 @@ def _make_failing_pet(toc_return):
     mock_pet.process = MagicMock()
     mock_pet.process.poll.return_value = None
     mock_pet._own_pgrp = False
-    mock_pet.start.side_effect = PetanqueError(1, "Reference not found.")
+    # pet_start 的 Theorem_not_found 使用独立 JSON-RPC code，不是任意 Coq 错误。
+    mock_pet.start.side_effect = PetanqueError(-32006, "Theorem_not_found: missing")
     mock_pet.toc.return_value = toc_return
     return mock_pet
 
@@ -980,6 +981,35 @@ class TestStartNotFoundAvailableInFile(_MockPetBase):
         assert result["reason"] == "not_found"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("code,message", [
+        (1, "Reference not found."),
+        (-32001, "Coq: Syntax error: illegal begin of vernac."),
+        (-32603, "Anomaly: backend failure"),
+    ])
+    async def test_other_backend_errors_are_not_missing_theorems(
+        self, failing_pet_workspace, code, message,
+    ):
+        """错误码不符时不读全文 TOC，也不把任意异常重分类成缺名。"""
+        from unittest.mock import patch
+        from pytanque import PetanqueError
+        import rocq_mcp.server as server
+        import rocq_mcp.interactive as interactive
+
+        ws, _ = failing_pet_workspace
+        pet = _make_failing_pet([("main", [_make_toc_elem("t")])])
+        pet.start.side_effect = PetanqueError(code, message)
+        with patch.object(server, "_ensure_pet", return_value=pet):
+            result = await interactive.run_start(
+                file="test.v", theorem="missing", workspace=str(ws),
+                lifespan_state=self._lifespan_state(pet),
+            )
+        assert result["success"] is False
+        assert result["reason"] == "crashed"
+        assert result["error"] == message
+        assert "available_in_file" not in result
+        pet.toc.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_toc_cache_hit_avoids_re_call(self, failing_pet_workspace):
         """Two failures against the same file (same mtime) → pet.toc once."""
         from unittest.mock import patch
@@ -1043,9 +1073,8 @@ class TestStartNotFoundAvailableInFile(_MockPetBase):
         assert mock_pet.toc.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_toc_pet_raises_returns_empty(self, failing_pet_workspace):
-        """When ``pet.toc`` raises, ``_toc_names_cached`` returns ``[]``
-        and no entry is cached (so a later retry can succeed).
+    async def test_toc_pet_failure_propagates_without_caching(self, failing_pet_workspace):
+        """补充 TOC 失败应报告真实故障，不伪造空清单；不缓存失败。
         """
         from unittest.mock import patch
 
@@ -1067,6 +1096,8 @@ class TestStartNotFoundAvailableInFile(_MockPetBase):
             )
 
         assert result["success"] is False
+        assert result["reason"] == "crashed"
+        assert result["error"] == "Unexpected error: boom"
         assert "available_in_file" not in result
         # Failure must not be cached — retries should be possible.
         assert _TOC_CACHE == {}
@@ -1234,13 +1265,15 @@ class TestStartTimeoutForwarding:
         assert captured.get("timeout") is None
 
     @pytest.mark.asyncio
-    async def test_wrapper_clamps_to_pet_timeout_cap(self, monkeypatch, tmp_path):
-        """rocq_start clamps timeout to ROCQ_QUERY_TIMEOUT_CAP and echoes it."""
+    @pytest.mark.parametrize("file,cap", [("t.v", 180), (None, 60)])
+    async def test_wrapper_clamps_to_mode_specific_timeout_cap(self, monkeypatch, tmp_path, file, cap):
+        """文件前缀加载与局部 preamble 请求使用独立上限。"""
         from types import SimpleNamespace
 
         import rocq_mcp.server as srv
 
         monkeypatch.setattr(srv, "ROCQ_QUERY_TIMEOUT_CAP", 60)
+        monkeypatch.setattr(srv, "ROCQ_START_TIMEOUT", 180)
         monkeypatch.setattr(srv, "_validate_workspace", lambda ws: None)
 
         captured: dict = {}
@@ -1253,14 +1286,15 @@ class TestStartTimeoutForwarding:
 
         ctx = SimpleNamespace(lifespan_context={"pet_timeout": 30.0})
         result = await srv.rocq_start(
-            file="t.v",
-            theorem="t",
+            file=file,
+            theorem="t" if file else None,
+            preamble="" if file else "Require Import Arith.",
             workspace=str(tmp_path),
             timeout=600,
             ctx=ctx,
         )
-        assert captured["timeout"] == 60.0
-        assert result["clamped_timeout"] == 60
+        assert captured["timeout"] == float(cap)
+        assert result["clamped_timeout"] == cap
 
     @pytest.mark.asyncio
     async def test_wrapper_does_not_clamp_below_cap(self, monkeypatch, tmp_path):
@@ -1269,7 +1303,8 @@ class TestStartTimeoutForwarding:
 
         import rocq_mcp.server as srv
 
-        monkeypatch.setattr(srv, "ROCQ_QUERY_TIMEOUT_CAP", 300)
+        monkeypatch.setattr(srv, "ROCQ_QUERY_TIMEOUT_CAP", 60)
+        monkeypatch.setattr(srv, "ROCQ_START_TIMEOUT", 180)
         monkeypatch.setattr(srv, "_validate_workspace", lambda ws: None)
 
         captured: dict = {}

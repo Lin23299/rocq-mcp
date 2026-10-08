@@ -1775,12 +1775,12 @@ class TestBuildCheckSuccessDictTacticPath:
 
 
 # =========================================================================
-# _format_goals — truncation and formatting
+# _format_goals — formatting and explicit preview clipping
 # =========================================================================
 
 
 class TestFormatGoals:
-    """Test _format_goals formatting, truncation by count and by length."""
+    """原文格式化不按目标个数丢项；预览裁剪与补读由不同层负责。"""
 
     def _make_goal(self, hyps_list=None, conclusion="True"):
         """Create a mock goal object with .hyps and .ty attributes."""
@@ -1801,29 +1801,30 @@ class TestFormatGoals:
             goal.hyps = mock_hyps
         return goal
 
-    def test_truncates_many_goals(self):
-        """More than _MAX_GOALS_SHOWN goals triggers the count truncation message."""
-        from rocq_mcp.interactive import _format_goals, _MAX_GOALS_SHOWN
+    def test_formats_all_goals_without_old_count_truncation(self):
+        """不能在完整打印快照产生前按旧个数阈值丢失尾部目标。"""
+        from rocq_mcp.interactive import _format_goals
 
         goals = [
-            self._make_goal(conclusion=f"goal_{i}") for i in range(_MAX_GOALS_SHOWN + 5)
+            self._make_goal(conclusion=f"goal_{i}") for i in range(100)
         ]
         result = _format_goals(goals)
-        assert "goals total, showing first" in result
-        assert str(_MAX_GOALS_SHOWN + 5) in result
+        assert result == "\n\n".join(f"Goal {i + 1}:\n\n|-goal_{i}" for i in range(100))
+        assert "clipped" not in result
 
-    def test_truncates_long_output(self):
-        """Goals producing very long text (>_MAX_GOALS_LENGTH) are truncated."""
-        from rocq_mcp.interactive import _format_goals, _MAX_GOALS_LENGTH
+    def test_long_goal_preview_is_explicit_and_full_render_keeps_tail(self):
+        """首屏可裁剪，但快照完整渲染必须保留同一来源全部文字。"""
+        from rocq_mcp.interactive import _format_goals
 
         # Create a single goal with a very long conclusion
-        long_conclusion = "x" * (_MAX_GOALS_LENGTH + 500)
+        long_conclusion = "HEAD" + "x" * 50_000 + "MIDDLE" + "y" * 50_000 + "TAIL"
         goals = [self._make_goal(conclusion=long_conclusion)]
-        result = _format_goals(goals)
-        assert "truncated" in result
-        # The result should be bounded (within _MAX_GOALS_LENGTH + truncation message)
-        # The function truncates at _MAX_GOALS_LENGTH then appends message
-        assert len(result) < _MAX_GOALS_LENGTH + 200
+        result = _format_goals(goals, max_chars=2_000)
+        assert "[clipped " in result
+        assert "HEAD" in result and result.endswith("TAIL")
+        assert "MIDDLE" not in result
+        assert len(result) < 2_400
+        assert _format_goals(goals, max_chars=-1) == "\n|-" + long_conclusion
 
     def test_normal_goals_not_truncated(self):
         """Two small goals should not trigger any truncation."""

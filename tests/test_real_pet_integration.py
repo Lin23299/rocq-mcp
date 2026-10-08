@@ -131,8 +131,9 @@ class TestNotFoundEnrichmentRealPet:
     """
 
     @pytest.mark.asyncio
-    async def test_typo_yields_not_found_with_real_available_in_file(self, workspace):
-        from rocq_mcp.interactive import run_assumptions
+    @pytest.mark.parametrize("tool", ["rocq_assumptions", "rocq_start"])
+    async def test_typo_yields_not_found_with_real_available_in_file(self, workspace, tool):
+        from rocq_mcp.interactive import run_assumptions, run_start, run_query
         from rocq_mcp.server import _invalidate_pet
 
         vfile = Path(workspace) / "real_pet_typo.v"
@@ -146,12 +147,25 @@ class TestNotFoundEnrichmentRealPet:
         ls["recent_errors"] = deque(maxlen=10)
 
         try:
-            result = await run_assumptions(
-                name="fool_bound",  # typo for fuel_bound
-                file="real_pet_typo.v",
-                workspace=str(workspace),
-                lifespan_state=ls,
-            )
+            if tool == "rocq_assumptions":
+                # 固定真实 Print Assumptions 错误的协议形状，不能只改 mock。
+                raw = await run_query(
+                    command="Print Assumptions fool_bound.", preamble="", file="real_pet_typo.v",
+                    workspace=str(workspace), lifespan_state=ls, auto_record=False,
+                )
+                assert raw["success"] is False and raw["reason"] == "crashed"
+                assert " ".join(raw["error"].split()) == (
+                    "Coq: The reference fool_bound was not found in the current environment.")
+                result = await run_assumptions(
+                    name="fool_bound", file="real_pet_typo.v",
+                    workspace=str(workspace), lifespan_state=ls,
+                )
+            else:
+                result = await run_start(
+                    theorem="fool_bound", file="real_pet_typo.v",
+                    workspace=str(workspace), lifespan_state=ls,
+                )
+                assert result["error"] == "Theorem_not_found: fool_bound"
             assert result["success"] is False
             assert result["reason"] == "not_found"
             names = result.get("available_in_file") or []
@@ -165,9 +179,26 @@ class TestNotFoundEnrichmentRealPet:
             not_found = [
                 e
                 for e in ls["recent_errors"]
-                if e.get("tool") == "rocq_assumptions"
+                if e.get("tool") == tool
                 and e.get("reason") == "not_found"
             ]
-            assert len(not_found) >= 1
+            assert len(not_found) == 1
+
+            # 同一后端仍活着，正确名称仍能读取/开 proof，缺名不是 pet 崩溃。
+            pid = ls["pet_client"].process.pid
+            if tool == "rocq_assumptions":
+                ok = await run_assumptions(
+                    name="fuel_bound", file="real_pet_typo.v",
+                    workspace=str(workspace), lifespan_state=ls,
+                )
+                assert ok["assumptions"] == []
+            else:
+                ok = await run_start(
+                    theorem="fuel_bound", file="real_pet_typo.v",
+                    workspace=str(workspace), lifespan_state=ls,
+                )
+                assert "True" in ok["goals"] and ok["proof_finished"] is False
+            assert ok["success"] is True
+            assert ls["pet_client"].process.pid == pid
         finally:
             _invalidate_pet(ls)

@@ -582,7 +582,7 @@ class TestRocqAssumptionsWrapper:
 
 
 class TestAssumptionsAvailableInFile:
-    """When run_query fails (e.g. theorem not found), run_assumptions should
+    """When run_query reports the requested reference missing, run_assumptions should
     attach ``available_in_file`` populated by the cached pet.toc lookup.
 
     These tests mock both ``run_query`` and ``_fetch_available_in_file`` so
@@ -591,12 +591,13 @@ class TestAssumptionsAvailableInFile:
 
     @pytest.mark.asyncio
     async def test_failure_attaches_available_in_file(self, monkeypatch):
-        """A failed run_query response must be augmented with the
+        """A requested-reference-not-found response must be augmented with the
         capped name list returned by ``_fetch_available_in_file``."""
         import rocq_mcp.interactive as _int
 
         async def mock_run_query(**kwargs):
-            return {"success": False, "error": "Reference foo not found."}
+            return {"success": False, "reason": "crashed", "error":
+                    "Coq: The reference foo was not found in the current environment."}
 
         async def mock_fetch_available(**kwargs):
             return _int._AvailableInFile(["alpha", "foo_bar", "zeta"], False, 3)
@@ -629,7 +630,8 @@ class TestAssumptionsAvailableInFile:
         from rocq_mcp.interactive import _DEFAULT_TOC_LIMIT
 
         async def mock_run_query(**kwargs):
-            return {"success": False, "error": "Reference foo not found."}
+            return {"success": False, "reason": "crashed", "error":
+                    "Coq: The reference foo was not found in the current environment."}
 
         async def mock_fetch_available(**kwargs):
             return _int._AvailableInFile(["a", "b", "c"], True, 1234)
@@ -655,13 +657,17 @@ class TestAssumptionsAvailableInFile:
 
     @pytest.mark.asyncio
     async def test_failure_skips_field_when_helper_returns_empty(self, monkeypatch):
-        """No symbols → no field; the failure response is otherwise unchanged."""
+        """空 TOC 不加清单字段，但原始缺名错误仍重分类为 not_found。"""
         import rocq_mcp.interactive as _int
 
         async def mock_run_query(**kwargs):
-            return {"success": False, "error": "Reference foo not found."}
+            return {"success": False, "reason": "crashed", "error":
+                    "Coq: The reference foo was not found in the current environment."}
+
+        called = []
 
         async def mock_fetch_available(**kwargs):
+            called.append(kwargs)
             return _int._AvailableInFile([], False, 0)
 
         monkeypatch.setattr(_int, "run_query", mock_run_query)
@@ -675,6 +681,8 @@ class TestAssumptionsAvailableInFile:
         )
 
         assert result["success"] is False
+        assert result["reason"] == "not_found"
+        assert len(called) == 1
         assert "available_in_file" not in result
         assert "available_in_file_truncated" not in result
         assert "available_in_file_total" not in result
@@ -754,8 +762,8 @@ class TestAssumptionsAvailableInFile:
     async def test_pet_restarted_crashed_skips_enrichment(self, monkeypatch):
         """``reason="crashed"`` *with* ``pet_restarted: True`` means the
         pet process actually died — skip the extra ``pet.toc`` call.
-        (A bare ``reason="crashed"`` without ``pet_restarted`` is a live
-        Coq error — typo recovery — and DOES trigger enrichment; that
+        (A live Coq error triggers enrichment only if it identifies the
+        requested reference as missing; that
         path is covered by ``test_typo_failure_records_not_found_reason``.)
         """
         import rocq_mcp.interactive as _int
@@ -763,7 +771,7 @@ class TestAssumptionsAvailableInFile:
         async def mock_run_query(**kwargs):
             return {
                 "success": False,
-                "error": "Pet process died.",
+                "error": "Coq: The reference foo was not found in the current environment.",
                 "reason": "crashed",
                 "pet_restarted": True,
             }
@@ -805,7 +813,7 @@ class TestAssumptionsAvailableInFile:
         async def mock_run_query(**kwargs):
             return {
                 "success": False,
-                "error": "Reference fool_bound not found.",
+                "error": "Coq: The reference fool_bound was not found in the current environment.",
                 "reason": "crashed",
             }
 
@@ -860,7 +868,7 @@ class TestAssumptionsAvailableInFile:
             assert kwargs.get("auto_record") is False
             return {
                 "success": False,
-                "error": "Reference fool_bound not found.",
+                "error": "Coq: The reference fool_bound was not found in the current environment.",
                 "reason": "crashed",
             }
 
@@ -902,7 +910,7 @@ class TestAssumptionsAvailableInFile:
         async def mock_run_query(**kwargs):
             return {
                 "success": False,
-                "error": "Reference foo not found.",
+                "error": "Coq: The reference foo was not found in the current environment.",
                 "reason": "not_found",
             }
 
@@ -931,6 +939,33 @@ class TestAssumptionsAvailableInFile:
             if e.get("tool") == "rocq_assumptions" and e.get("reason") == "not_found"
         ]
         assert len(not_found_entries) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [
+        "Reference foo not found.",
+        "Coq: The reference dependency was not found in the current environment.",
+        "Coq: Syntax error: illegal begin of vernac.",
+        "Anomaly: unrelated backend failure.",
+    ])
+    async def test_other_failures_do_not_trigger_name_enrichment(self, monkeypatch, error):
+        """不能凭 TOC 非空把前缀、语法或系统错误重分类成缺名。"""
+        import rocq_mcp.interactive as _int
+
+        async def mock_run_query(**kwargs):
+            return {"success": False, "reason": "crashed", "error": error}
+
+        async def unexpected_fetch(**kwargs):
+            pytest.fail("Unrelated failure must not load the file TOC")
+
+        monkeypatch.setattr(_int, "run_query", mock_run_query)
+        monkeypatch.setattr(_int, "_fetch_available_in_file", unexpected_fetch)
+        result = await run_assumptions(
+            name="foo", file="test.v", workspace="/tmp", lifespan_state={},
+        )
+        assert result["success"] is False
+        assert result["reason"] == "crashed"
+        assert result["error"] == error
+        assert "available_in_file" not in result
 
 
 # ---------------------------------------------------------------------------
