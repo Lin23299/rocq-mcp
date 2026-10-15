@@ -2976,6 +2976,12 @@ async def _handle_pet_failure(
     resp: dict[str, Any] = {"success": False, "error": error, "reason": reason}
     if killed_pet:
         resp["pet_restarted"] = True
+    elif reason == "crashed":
+        # Pet still alive ⇒ the failure is a live PetanqueError, i.e. a
+        # Coq-level error (syntax/type/reference/tactic), NOT a process
+        # crash.  Tag it additively so workers/observers can separate
+        # "Coq said no" from "backend died" without re-parsing `error`.
+        resp["coq_error"] = True
     if partial_state:
         _merge_partial_state(resp, partial_state)
     if auto_record:
@@ -3058,9 +3064,12 @@ async def _run_with_pet(
     lock_timeout = _timeout * 0.8
 
     def _execute() -> Any:
+        from rocq_mcp import native_states
         lock = _pet_lock  # capture local ref (survives _force_release_pet_lock)
         if not lock.acquire(timeout=lock_timeout):
             raise _PetLockTimeout("Could not acquire pet lock")
+        pet = None
+        result = None
         try:
             selected_workspace = workspace
             if from_state is not None:
@@ -3084,6 +3093,14 @@ async def _run_with_pet(
                     return _fail(lifespan_state, tool, "Workspace is being updated; resume after the update command finishes.",
                                  reason="workspace_updating")
             pet = _ensure_pet(lifespan_state)
+            native_states.begin(pet, lifespan_state)
+            if lifespan_state.get("native_release_error"):
+                try:
+                    native_states.finish(pet, lifespan_state)
+                except Exception as exc:
+                    return _fail(lifespan_state, tool, f"Pending native state release: {exc}",
+                                 reason="unavailable")
+                native_states.begin(pet, lifespan_state)
             refreshed = False
             if watch:
                 try:
@@ -3095,6 +3112,10 @@ async def _run_with_pet(
                     return _fail(lifespan_state, tool, "Workspace dependencies changed; old state invalidated. Start from saved source.",
                                  reason="state_invalidated", workspace_refreshed=True)
             result = fn(pet)
+            if (getattr(pet, "_ccv_native_attached", False) is True
+                    and lifespan_state.get("pet_client") is not pet):
+                return _updated_during_call(lifespan_state, tool, result,
+                                           "Pet instance changed during execution; old IDs cannot continue.")
             if watch:
                 try:
                     after = read_signal(selected_workspace)
@@ -3113,6 +3134,15 @@ async def _run_with_pet(
                 result["workspace_refreshed"] = True
             return result
         finally:
+            if (pet is not None and getattr(pet, "_ccv_native_attached", False)
+                    and lifespan_state.get("pet_client") is pet and _pet_alive(pet)):
+                try:
+                    native_states.finish(pet, lifespan_state)
+                except Exception as exc:
+                    message = str(exc)[:500]
+                    lifespan_state["native_release_error"] = message
+                    if isinstance(result, dict):
+                        result["state_release_error"] = message
             lock.release()
 
     sem = _get_pet_semaphore()
@@ -4089,11 +4119,10 @@ async def rocq_start(
     tactic, point at any character of the tactic (including its
     period) or at the whitespace immediately following the period.
 
-    **Important:** The interactive session reads the file at start time and
-    does not track subsequent edits. If another process or agent modifies the
-    file while a session is active, the proof state becomes stale and tactics
-    may fail or produce wrong results. To avoid this, work on a **copy** of
-    the file for interactive proving, or restart the session after edits.
+    File edits invalidate states whose executed source prefix reaches past
+    the edit. A surviving predecessor is returned as ``resume_from`` with
+    ``resume_at``; source changes do not inherently require restarting Pet.
+    Dependency refresh and Pet death invalidate the old environment.
 
     Args:
         file: Path to the .v file (relative to workspace).
@@ -4382,10 +4411,11 @@ async def rocq_check(
     case ``proof_finished`` can diverge from a clean compile — re-verify with
     ``rocq_compile_file``).
 
-    On a mid-batch failure the envelope carries ``partial``: when true, some
-    commands already ran, so ``last_valid_state_id`` sits mid-body and is
-    **not** any file position; the ``hint`` then points at the original
-    ``from_state`` so a corrected body replays from the same anchor.
+    On a mid-batch failure, ``last_valid_state_id`` is the live predecessor
+    of the failed command. Continue the corrected suffix from that ID.
+    An interactive predecessor need not correspond to a file position.
+    ``check_budget`` reports the effective batch budget after defaults and
+    clamping, and confirms that it was not divided by command count.
 
     Args:
         body: Commands to execute (one or more Rocq sentences).
@@ -4397,7 +4427,9 @@ async def rocq_check(
         workspace: Accepted for API compatibility but unused; the
             active workspace comes from the state entry set by
             ``rocq_start``.
-        timeout: Per-call timeout in seconds for the batch of commands.
+        timeout: Total request budget in seconds for the batch of commands,
+            not divided by their number. Existing Rocq sentence protection
+            and the outer request watchdog remain active.
             Default 0 uses ``ROCQ_PET_TIMEOUT`` (env var, default 30).
             Raise this for compute-heavy tactics (``vm_compute``,
             ``native_compute``).  Clamped to ``ROCQ_QUERY_TIMEOUT_CAP``
@@ -4437,6 +4469,9 @@ async def rocq_check(
         goals_max_chars=goals_max_chars,
         capture_feedback=True,
     )
+    if isinstance(result, dict):
+        result["check_budget"] = {"effective_batch_seconds": effective_timeout,
+                                  "divided_by_command_count": False}
     if clamped and isinstance(result, dict):
         result["clamped_timeout"] = ROCQ_QUERY_TIMEOUT_CAP
     if (isinstance(result, dict) and ctx.lifespan_context.get("output_stdio")

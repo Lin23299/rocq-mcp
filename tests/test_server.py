@@ -2087,7 +2087,10 @@ class TestPetInvalidationHooks:
         """Invalidation hooks clear the import cache."""
         from rocq_mcp.interactive import _import_cache, _invalidate_import_cache
 
-        _import_cache["test_key"] = "test_value"
+        from rocq_mcp.interactive import _CachedImportContext
+        from types import SimpleNamespace
+        _import_cache["test_key"] = _CachedImportContext(
+            SimpleNamespace(st=1), "test_key", "/tmp", 0)
         assert len(_import_cache) > 0
 
         _invalidate_import_cache()
@@ -2127,7 +2130,10 @@ class TestPetInvalidationHooks:
         assert len(_state_table) > 0
 
         # Populate import cache
-        _import_cache["key"] = "value"
+        from rocq_mcp.interactive import _CachedImportContext
+        from types import SimpleNamespace
+        _import_cache["key"] = _CachedImportContext(
+            SimpleNamespace(st=1), "key", "/tmp", 0)
         assert len(_import_cache) > 0
 
         # Call _invalidate_pet (no real pet, so pet_client is None)
@@ -2462,6 +2468,55 @@ class TestRunWithPetExceptionHandling:
         assert result["success"] is False
         assert "pet_restarted" not in result
         assert "Tactic failed" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_petanque_error_alive_pet_tags_coq_error(self):
+        """PetanqueError + alive pet -> additive ``coq_error: True`` marker.
+
+        A live-pet PetanqueError is a Coq-level failure (tactic/syntax/
+        reference), not a process crash.  The marker lets workers and
+        observers separate the two without parsing ``error`` text; the
+        dead-pet path must NOT carry it."""
+        from unittest.mock import MagicMock
+
+        try:
+            from pytanque import PetanqueError
+        except ImportError:
+            pytest.skip("pytanque not installed")
+
+        mock_pet = MagicMock()
+        mock_pet.process = MagicMock()
+        mock_pet.process.poll.return_value = None  # alive
+
+        lifespan_state = make_lifespan_state(pet_timeout=10.0)
+        lifespan_state["pet_client"] = mock_pet
+
+        def fn_that_raises(pet):
+            raise PetanqueError(1, "Coq: Syntax error")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("rocq_mcp.server._ensure_pet", lambda ls: mock_pet)
+            result = await _run_with_pet(fn_that_raises, lifespan_state, "Test")
+        assert result["success"] is False
+        assert result.get("coq_error") is True
+
+        # Dead pet keeps the crash semantics and must not claim coq_error.
+        dead_pet = MagicMock()
+        dead_pet.process = MagicMock()
+        dead_pet.process.poll.return_value = -1  # exited
+
+        def fn_that_raises_dead(pet):
+            raise PetanqueError(1, "Pet process died")
+
+        lifespan_dead = make_lifespan_state(pet_timeout=10.0)
+        lifespan_dead["pet_client"] = dead_pet
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("rocq_mcp.server._ensure_pet", lambda ls: dead_pet)
+            result_dead = await _run_with_pet(
+                fn_that_raises_dead, lifespan_dead, "Test"
+            )
+        assert result_dead.get("pet_restarted") is True
+        assert "coq_error" not in result_dead
 
     @pytest.mark.asyncio
     async def test_broken_pipe_calls_on_timeout_callback(self):
