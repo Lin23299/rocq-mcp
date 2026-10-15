@@ -2,7 +2,7 @@
 
 - ``_build_check_failure_dict`` must mark mid-body failure states as
   ``partial`` and must not recommend them as "the state before the next
-  file sentence"; the hint points at the original base ``from_state``.
+   file sentence"; the live predecessor resumes the corrected suffix.
 - Position-based starts must echo the anchored line text + file
   fingerprint so callers can confirm which sentence they anchored to
   after edits shifted line numbers.
@@ -47,11 +47,13 @@ class TestPartialFailureEnvelope:
         result = self._build(2)
         assert result["partial"] is True
         assert result["commands_run"] == 2
-        # The partial state is named as partial; resume points at the base.
-        assert "from_state=7 is a PARTIAL state" in result["hint"]
-        assert "original from_state (3)" in result["hint"]
+        assert result["last_valid_state_id"] == 7
+        assert "last_valid_state_id=7" in result["hint"]
+        assert "Continue the corrected suffix" in result["hint"]
+        assert "not a file position" in result["hint"]
+        assert "Re-issue the corrected body" not in result["hint"]
 
-    def test_partial_without_base_falls_back_to_original(self):
+    def test_partial_without_base_still_uses_actual_predecessor(self):
         result = _build_check_failure_dict(
             error_message="Coq: nope.",
             failed_command="bad.",
@@ -63,7 +65,8 @@ class TestPartialFailureEnvelope:
             stale_warning=None,
         )
         assert result["partial"] is True
-        assert "original from_state" in result["hint"]
+        assert "last_valid_state_id=9" in result["hint"]
+        assert "live predecessor" in result["hint"]
 
 
 class TestReadLineText:

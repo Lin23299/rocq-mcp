@@ -53,6 +53,7 @@ import rocq_mcp.server as _server
 
 # _split_rocq_sentences is in compile — import directly (no cycle).
 from rocq_mcp.compile import _split_rocq_sentences, _is_focus_token
+from rocq_mcp import native_states
 
 # ---------------------------------------------------------------------------
 # Goal formatting helper (shared by run_check, run_step_multi)
@@ -644,7 +645,8 @@ def _get_or_create_import_state(
 
     # Bound cache size (FIFO eviction)
     if len(_import_cache) > _MAX_IMPORT_CACHE_SIZE:
-        del _import_cache[next(iter(_import_cache))]
+        old = _import_cache.pop(next(iter(_import_cache)))
+        native_states.retire(old.state)
 
     return state
 
@@ -693,6 +695,8 @@ def _get_file_end_state(
 def _invalidate_import_cache() -> None:
     """Clear all cached import states (called on pet crash/invalidation)."""
     global _import_cache_generation
+    for entry in _import_cache.values():
+        native_states.retire(entry.state)
     _import_cache.clear()
     _import_cache_generation += 1
 
@@ -829,6 +833,7 @@ def _state_add(
     child created *after* a dependency rebuild must not look fresh.
     """
     global _state_next_id
+    native_states.assert_current()
     sid = _state_next_id
     _state_next_id += 1
     parent = _state_table.get(parent_id) if parent_id is not None else None
@@ -852,7 +857,8 @@ def _state_add(
     )
     # Evict LRU entries when table exceeds max size.
     while len(_state_table) > _MAX_STATES:
-        evicted_id, _ = _state_table.popitem(last=False)
+        evicted_id, evicted = _state_table.popitem(last=False)
+        native_states.retire(evicted.state)
         _drop_snapshot_if_unreferenced(evicted_id)
     return sid
 
@@ -872,7 +878,9 @@ def _state_get(state_id: int) -> _StateEntry | None:
 
 def _state_remove(state_id: int) -> None:
     """Drop a state from the table (frees a session snapshot if unreferenced)."""
-    _state_table.pop(state_id, None)
+    removed = _state_table.pop(state_id, None)
+    if removed is not None:
+        native_states.retire(removed.state)
     _drop_snapshot_if_unreferenced(state_id)
 
 
@@ -901,6 +909,8 @@ def _state_get_or_error(state_id: int) -> tuple[_StateEntry | None, str | None]:
 
 def _state_invalidate_all() -> None:
     """Clear all states (called on pet crash/invalidation)."""
+    for entry in _state_table.values():
+        native_states.retire(entry.state)
     _state_table.clear()
     _session_snapshots.clear()
     _invalidated_tombstones.clear()
@@ -933,7 +943,7 @@ def _invalidate_workspace_states() -> None:
 def _read_file_text(path: str) -> str | None:
     """Read a file as text (best effort; None when unreadable)."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
             return fh.read()
     except OSError:
         return None
@@ -953,20 +963,26 @@ def _offset_to_line_col(text: str, offset: int) -> tuple[int, int]:
     offset = max(0, min(offset, len(text)))
     line = text.count("\n", 0, offset)
     last_nl = text.rfind("\n", 0, offset)
-    return line, offset - (last_nl + 1)
+    return line, len(text[last_nl + 1:offset].encode("utf-16-le")) // 2
 
 
 def _line_col_to_offset(text: str, line: int, character: int) -> int:
     """Translate 0-indexed (line, character) into a character offset."""
-    if line <= 0:
-        return max(0, min(character, len(text)))
     idx = 0
     for _ in range(line):
         nl = text.find("\n", idx)
         if nl < 0:
             return len(text)
         idx = nl + 1
-    return min(len(text), idx + max(0, character))
+    units = 0
+    pos = idx
+    while pos < len(text) and text[pos] != "\n":
+        width = len(text[pos].encode("utf-16-le")) // 2
+        if units + width > max(0, character):
+            break
+        units += width
+        pos += 1
+    return pos
 
 
 def _match_command_at(text: str, offset: int, cmd: str) -> int | None:
@@ -2273,6 +2289,11 @@ def _build_position_start_result(
         if file_text is not None:
             consumed = _anchor_consumed(file_text, line, character)
 
+        precise = native_states.snapshot(pet, state, resolved_file)
+        if precise is not None:
+            file_text, consumed = precise
+            file_hash = hashlib.sha256(file_text.encode("utf-8")).hexdigest()
+
     theorem = f"@pos({line},{character})"
     goals, focus_depth = _try_get_goals_with_depth(pet, state, goals_max_chars)
     state_id = _state_add(
@@ -2371,10 +2392,12 @@ def _build_theorem_start_result(
     except OSError:
         file_mtime = None
     file_hash = _file_content_hash(resolved_file)
-    # A theorem start has no cursor offset; treat the whole file as the
-    # dependency (any content change drops the session's states).
     file_text = _read_file_text(resolved_file)
     consumed = len(file_text) if file_text is not None else None
+    precise = native_states.snapshot(pet, state, resolved_file)
+    if precise is not None:
+        file_text, consumed = precise
+        file_hash = hashlib.sha256(file_text.encode("utf-8")).hexdigest()
     goals, focus_depth = _try_get_goals_with_depth(pet, state, goals_max_chars)
     state_id = _state_add(
         state=state,
@@ -2637,10 +2660,8 @@ def _run_one_check_command(
 
     try:
         if _is_timeout_eligible(cmd) and timeout >= 1:
-            if is_single:
-                rocq_timeout: int | None = int(timeout)
-            else:
-                rocq_timeout = max(1, int(timeout / total_commands))
+            # 顺序批次共用外层预算；命令条数不得压低原有句级保护。
+            rocq_timeout: int | None = int(timeout)
         else:
             rocq_timeout = None
 
@@ -2669,11 +2690,12 @@ def _run_one_check_command(
         # body, edited text) does not — the state then keeps the parent's
         # offset and is flagged as not file-faithful.
         faithful: bool | None = None
-        new_consumed = entry.consumed
-        if entry.session_root is not None and entry.consumed is not None:
-            snap = _session_snapshots.get(entry.session_root)
+        progress = _state_table.get(prev_state_id, entry)
+        new_consumed = progress.consumed
+        if progress.session_root is not None and progress.consumed is not None:
+            snap = _session_snapshots.get(progress.session_root)
             if snap is not None:
-                advanced = _match_command_at(snap.text, entry.consumed, cmd)
+                advanced = _match_command_at(snap.text, progress.consumed, cmd)
                 if advanced is not None:
                     new_consumed = advanced
                     faithful = True
@@ -2741,9 +2763,8 @@ def _build_check_failure_dict(
     ``partial`` marks the case where commands already ran before the
     failure: ``last_valid_state_id`` then sits mid-body, corresponds to no
     file position, and must not be mistaken for "the state before the next
-    file sentence".  The hint only recommends resuming when no command had
-    run (``command_index == 0``); otherwise it points at the original base
-    state so a corrected body replays from the same anchor.
+    file sentence". It is nevertheless the live interactive predecessor;
+    the corrected suffix resumes there without replaying successful commands.
     """
     partial = command_index > 0
     result: dict[str, Any] = {
@@ -2768,17 +2789,16 @@ def _build_check_failure_dict(
             f"Use rocq_check(body='...', from_state={last_valid_state_id}) "
             f"or rocq_step_multi(tactics=[...], from_state={last_valid_state_id})."
         )
-    elif partial:
-        base = base_state_id if base_state_id is not None else "the original from_state"
+    elif partial and last_valid_state_id is not None:
         result["hint"] = (
             f"{command_index} command(s) already ran, so "
-            f"from_state={last_valid_state_id} is a PARTIAL state: it is not "
-            f"any file position and its prefix contains commands of the "
-            f"failed body. Re-issue the corrected body from the original "
-            f"from_state ({base}), or re-anchor with "
-            f"rocq_start(file=..., line=...) on the current file. Use "
-            f"rocq_step_multi(from_state={base}) for per-tactic outcomes."
+            f"last_valid_state_id={last_valid_state_id} is the live predecessor of "
+            f"the failed command. Continue the corrected suffix from that ID; "
+            f"it is an interactive state, not a file position. If revising an "
+            f"earlier successful command, branch from its earlier valid predecessor."
         )
+    elif partial:
+        result["hint"] = "No live predecessor was retained; recover from the saved source checkpoint."
     return result
 
 

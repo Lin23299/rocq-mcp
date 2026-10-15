@@ -66,7 +66,8 @@ async def test_native_refresh_clears_python_and_imports_keeps_process(scope, bac
     result = await server._run_with_pet(lambda _: {"success": True}, state, "test", workspace=str(scope))
     assert result["success"] and not any(k == "update" for k, _ in calls)
     sid = interactive._state_add(SimpleNamespace(proof_finished=False), "x.v", "t", str(scope), None, None, 0)
-    interactive._import_cache["old"] = object()
+    interactive._import_cache["old"] = interactive._CachedImportContext(
+        SimpleNamespace(st=1), "old", str(scope), 0)
     updates.publish(str(scope), "new", updating=False)
     invoked = []
     rejected = await server._run_with_pet(lambda _: invoked.append(1), state, "test", workspace=str(scope), from_state=sid)

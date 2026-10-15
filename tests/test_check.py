@@ -855,8 +855,8 @@ class TestCheckMultiCommandTimeout:
         sys.modules.pop("pytanque", None)
 
     @pytest.mark.asyncio
-    async def test_multi_command_divides_timeout(self):
-        """Multi-command run_check should divide timeout among commands."""
+    async def test_multi_command_keeps_sentence_timeout(self):
+        """Cheap neighboring commands must not lower the tactic protection."""
         from types import SimpleNamespace
         from unittest.mock import MagicMock, patch
 
@@ -908,10 +908,10 @@ class TestCheckMultiCommandTimeout:
             )
 
         assert result["success"] is True
-        # 3 commands with 30s timeout -> each gets max(1, 30/3) = 10s
+        # The outer batch deadline still applies; no per-command equal shares.
         assert len(recorded_timeouts) == 3
         for t in recorded_timeouts:
-            assert t == 10, f"Expected per-command timeout of 10, got {t}"
+            assert t == 30, f"Expected unchanged protection of 30, got {t}"
 
 
 # ---------------------------------------------------------------------------
@@ -950,4 +950,8 @@ class TestCheckClamp:
         )
 
         assert result["clamped_timeout"] == _server.ROCQ_QUERY_TIMEOUT_CAP
+        assert result["check_budget"] == {
+            "effective_batch_seconds": _server.ROCQ_QUERY_TIMEOUT_CAP,
+            "divided_by_command_count": False,
+        }
         assert captured["timeout"] == float(_server.ROCQ_QUERY_TIMEOUT_CAP)
