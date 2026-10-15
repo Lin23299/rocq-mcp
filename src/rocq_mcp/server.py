@@ -4469,6 +4469,24 @@ async def rocq_check(
         goals_max_chars=goals_max_chars,
         capture_feedback=True,
     )
+    if isinstance(result, dict) and result.get("success"):
+        # Stage-0 compile-gate ledger: record successful proof-side
+        # interactions so the Bash-side four-condition rule (fix doc §10)
+        # can see MCP progress.  Best-effort — never break the proof call.
+        try:
+            from rocq_mcp.interactive import _state_get
+            from rocq_mcp.compile_ledger import record_check
+
+            entry = _state_get(from_state) if from_state is not None else None
+            if entry is not None and getattr(entry, "file", None):
+                record_check(
+                    entry.workspace,
+                    entry.file,
+                    proof_finished=bool(result.get("proof_finished")),
+                    goals_chars=len(result.get("goals") or ""),
+                )
+        except Exception:  # noqa: BLE001 — ledger is advisory
+            pass
     if isinstance(result, dict):
         result["check_budget"] = {"effective_batch_seconds": effective_timeout,
                                   "divided_by_command_count": False}
